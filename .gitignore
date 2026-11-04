@@ -18,3 +18,7 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+verify_migration.bat
+update_env_vars.bat
+update_env_manual.txt
+cleanup_and_migrate.bat
