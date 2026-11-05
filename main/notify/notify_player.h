@@ -25,8 +25,11 @@ public:
     explicit NotifyPlayer(AudioService& audio_service);
     ~NotifyPlayer();
 
-    bool Start(std::string audio_url, std::vector<NotifySubtitle> subtitles, uint32_t playback_id,
-               SubtitleCallback subtitle_callback, FinishedCallback finished_callback);
+    // Streams a mono Ogg Opus file. `source` is an http(s) URL, or an absolute filesystem path
+    // when `local_file` is true (for example a file on the SD card).
+    bool Start(std::string source, std::vector<NotifySubtitle> subtitles, uint32_t playback_id,
+               SubtitleCallback subtitle_callback, FinishedCallback finished_callback,
+               bool local_file = false);
     void Stop();
     void OnPlaybackProgress(uint32_t playback_id, uint32_t media_position_ms);
     void OnPlaybackDrained();
@@ -53,9 +56,16 @@ private:
     bool stream_started_ = false;
     bool playback_drained_ = false;
     bool completion_reported_ = false;
+    bool local_file_ = false;
+
+    // Returns the number of bytes read, 0 at the end of the stream, or -1 on error.
+    using ReadFunction = std::function<int(char* buffer, size_t size)>;
 
     static void WorkerEntry(void* arg);
     void WorkerTask();
+    bool StreamFromHttp(const std::string& url, uint32_t playback_id);
+    bool StreamFromFile(const std::string& path, uint32_t playback_id);
+    bool StreamOgg(uint32_t playback_id, const ReadFunction& read);
     bool IsCancelled(uint32_t playback_id) const;
     FinishedCallback CompleteLocked(uint32_t& playback_id);
 };

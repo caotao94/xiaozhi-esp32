@@ -1217,6 +1217,20 @@ menu "Camera Configuration"
     endif
 endmenu
 
+menu "MetaOS"
+    depends on BOARD_TYPE_LICHUANG_DEV_S3
+
+    config METAOS_ENABLE
+        bool "Enable MetaOS V2 (SD card, local agent tools, Hermes bridge)"
+        default n
+        depends on SPIRAM
+        help
+            Mounts the TF card (SDMMC 1-bit: CLK GPIO47, CMD GPIO48, D0 GPIO21) and adds
+            MCP tools for reminders, local Ogg music playback and Hermes Agent bridge,
+            plus a touch UI (long press BOOT to open/close). Cards must be FAT32.
+            Build the "lichuang-dev-metaos" variant instead of enabling this by hand.
+endmenu
+
 menu "TAIJIPAI_S3_CONFIG"
     depends on BOARD_TYPE_TAIJI_PI_S3
     choice I2S_TYPE_TAIJIPI_S3

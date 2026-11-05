@@ -9,6 +9,10 @@
 #include "esp32_camera.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
+#if CONFIG_METAOS_ENABLE
+#include "metaos.h"
+#include "sd_card.h"
+#endif
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -68,6 +72,10 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+#if CONFIG_METAOS_ENABLE
+    SdmmcCard* sd_card_ = nullptr;
+    metaos::MetaOs* metaos_ = nullptr;
+#endif
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -124,6 +132,18 @@ private:
                 Application::GetInstance().StopListening();
             }
         });
+
+#if CONFIG_METAOS_ENABLE
+        // Long press opens or closes the MetaOS panel. Press-to-talk mode uses long presses
+        // for speaking, so the panel cannot be opened there; the MetaOS tools still work by voice.
+        boot_button_.OnLongPress([this]() {
+            if (metaos_ == nullptr ||
+                (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled())) {
+                return;
+            }
+            Application::GetInstance().Schedule([this]() { metaos_->TogglePanel(); });
+        });
+#endif
 
 #if CONFIG_USE_DEVICE_AEC
         boot_button_.OnDoubleClick([this]() {
@@ -277,6 +297,17 @@ private:
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+
+#if CONFIG_METAOS_ENABLE
+        sd_card_ = new SdmmcCard({
+            .mount_point = SD_CARD_MOUNT_POINT,
+            .clk = SD_CARD_PIN_CLK,
+            .cmd = SD_CARD_PIN_CMD,
+            .d0 = SD_CARD_PIN_D0,
+        });
+        metaos_ = new metaos::MetaOs(sd_card_);
+        metaos_->Initialize();
+#endif
     }
 
 public:

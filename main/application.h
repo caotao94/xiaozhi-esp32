@@ -118,7 +118,28 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-    
+
+    /**
+     * Play a local mono Ogg Opus file (for example from the SD card) through the
+     * notification path. Main task only. Fails unless the device is idle. Wake word, button,
+     * StopLocalPlayback() or a new conversation stop the playback. `on_finished` runs in the
+     * main task with true when the file played to its end.
+     */
+    bool StartLocalPlayback(const std::string& path, const std::string& title,
+                            std::function<void(bool completed)> on_finished = nullptr);
+    void StopLocalPlayback();
+    bool IsLocalPlaybackActive() const { return local_playback_active_; }
+    // Main task. True when StartLocalPlayback() would be accepted now: the device is idle,
+    // the previous playback task has exited and no conversation channel is open.
+    bool CanStartLocalPlayback() const;
+    // Main task. Ends an open conversation when the device is listening or idle; it never
+    // interrupts the assistant while it is speaking.
+    void EndConversation();
+    // Main task. Starts a conversation from text instead of the wake word, so the assistant
+    // answers `text` aloud (used for spoken reminders and background-task results). Works only
+    // when the device is idle and the server accepts wake-word text; returns false otherwise.
+    bool InvokeWithText(const std::string& text);
+
     /**
      * Reset protocol resources (thread-safe)
      * Can be called from any task to release resources allocated after network connected
@@ -144,6 +165,8 @@ private:
     AudioService audio_service_;
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
+    bool local_playback_active_ = false;
+    std::function<void(bool)> local_playback_finished_;
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;

@@ -733,10 +733,9 @@ void Application::InitializeProtocol() {
             if (cJSON_IsObject(payload)) {
                 CJsonStringUniquePtr payload_json(cJSON_PrintUnformatted(payload));
                 if (payload_json) {
-                    Schedule(
-                        [this, display, payload_str = std::string(payload_json.get())]() {
-                            display->SetChatMessage("system", payload_str.c_str());
-                        });
+                    Schedule([this, display, payload_str = std::string(payload_json.get())]() {
+                        display->SetChatMessage("system", payload_str.c_str());
+                    });
                 }
             } else {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
@@ -1237,7 +1236,102 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     }
 }
 
+bool Application::CanStartLocalPlayback() const {
+    return state_machine_.GetState() == kDeviceStateIdle && !notify_player_.IsBusy() &&
+           (!protocol_ || !protocol_->IsAudioChannelOpened());
+}
+
+bool Application::InvokeWithText(const std::string& text) {
+    if (GetDeviceState() != kDeviceStateIdle) {
+        return false;
+    }
+    // Sanitize: the text gets embedded into a JSON string, so control chars, quotes and
+    // backslashes must be replaced to avoid breaking the protocol message.
+    std::string sanitized;
+    for (char ch : text) {
+        if (ch == '"' || ch == '\\') {
+            sanitized += ' ';
+        } else if (ch < 0x20 && ch != '\t') {
+            sanitized += ' ';
+        } else {
+            sanitized += ch;
+        }
+    }
+    WakeWordInvoke(sanitized);
+    return true;
+}
+
+void Application::EndConversation() {
+    auto state = GetDeviceState();
+    if (protocol_ && protocol_->IsAudioChannelOpened() &&
+        (state == kDeviceStateIdle || state == kDeviceStateListening)) {
+        ESP_LOGI(TAG, "Ending the conversation for local playback");
+        protocol_->CloseAudioChannel();
+    }
+}
+
+bool Application::StartLocalPlayback(const std::string& path, const std::string& title,
+                                     std::function<void(bool completed)> on_finished) {
+    if (!CanStartLocalPlayback()) {
+        ESP_LOGW(TAG, "Ignoring local playback while the device is busy");
+        return false;
+    }
+
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+    audio_service_.ReleaseWakeWordResources();
+    while (audio_service_.PopPacketFromSendQueue()) {
+        // Discard microphone audio left over from a previous conversation.
+    }
+
+    if (!SetDeviceState(kDeviceStateNotifying)) {
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return false;
+    }
+
+    audio_service_.ResetDecoder();
+    uint32_t playback_id = ++notification_playback_id_;
+    if (playback_id == 0) {
+        playback_id = ++notification_playback_id_;
+    }
+
+    bool started = notify_player_.Start(
+        path, {}, playback_id, nullptr,
+        [this](uint32_t id, bool success) {
+            Schedule([this, id, success]() { HandleNotificationFinished(id, success); });
+        },
+        true);
+    if (!started) {
+        ESP_LOGE(TAG, "Failed to start local playback of %s", path.c_str());
+        StopNotification();
+        return false;
+    }
+
+    local_playback_active_ = true;
+    local_playback_finished_ = std::move(on_finished);
+    board.GetDisplay()->SetChatMessage("assistant", title.c_str());
+    return true;
+}
+
+void Application::StopLocalPlayback() {
+    if (local_playback_active_ && GetDeviceState() == kDeviceStateNotifying) {
+        StopNotification();
+    }
+}
+
 void Application::StopNotification() {
+    bool local_playback = local_playback_active_;
+    local_playback_active_ = false;
+    auto local_finished = std::move(local_playback_finished_);
+    local_playback_finished_ = nullptr;
+    // Report a local playback as interrupted unless HandleNotificationFinished() already
+    // reported its normal end.
+    if (local_playback && local_finished) {
+        Schedule([local_finished = std::move(local_finished)]() { local_finished(false); });
+    }
+
     notify_player_.Stop();
     audio_service_.ResetDecoder();
     auto& board = Board::GetInstance();
@@ -1254,6 +1348,12 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
+    if (local_playback_active_ && local_playback_finished_) {
+        auto local_finished = std::move(local_playback_finished_);
+        local_playback_finished_ = nullptr;
+        Schedule(
+            [local_finished = std::move(local_finished), success]() { local_finished(success); });
+    }
     StopNotification();
 }
 

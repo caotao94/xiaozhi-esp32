@@ -67,6 +67,18 @@ list(APPEND SOURCES
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET)
     list(APPEND SOURCES "boards/common/ethernet_board.cc")
 endif()
+if(CONFIG_METAOS_ENABLE)
+    list(APPEND SOURCES
+        "boards/common/sd_card.cc"
+        "metaos/metaos.cc"
+        "metaos/metaos_common.cc"
+        "metaos/metaos_hermes.cc"
+        "metaos/metaos_music.cc"
+        "metaos/metaos_panel.cc"
+        "metaos/metaos_reminders.cc"
+    )
+    list(APPEND INCLUDE_DIRS "metaos")
+endif()
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
 
@@ -1186,7 +1198,7 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT AND IDF_VERSION_MAJOR LESS 6)
         espressif__touch_button_sensor
     )
 endif()
-if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
+if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD OR CONFIG_METAOS_ENABLE)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         esp_driver_sdmmc
         sdmmc

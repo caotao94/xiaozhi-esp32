@@ -58,5 +58,11 @@
 
 #define XCLK_FREQ_HZ 20000000
 
+/* TF card, SDMMC 1-bit mode (pins from the LCKFB board tutorial). Used by MetaOS. */
+#define SD_CARD_MOUNT_POINT "/sdcard"
+#define SD_CARD_PIN_CLK GPIO_NUM_47
+#define SD_CARD_PIN_CMD GPIO_NUM_48
+#define SD_CARD_PIN_D0  GPIO_NUM_21
+
 
 #endif // _BOARD_CONFIG_H_
