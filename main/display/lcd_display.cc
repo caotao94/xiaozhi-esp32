@@ -856,7 +856,9 @@ void LcdDisplay::RemoveChatMessage(const char* role, const char* content) {
             chat_message_label_ = nullptr;
         }
         lv_obj_del(container);
-        if (lv_obj_get_child_cnt(content_) == 0 && emoji_label_ != nullptr) {
+        // The centered logo stands in for an empty chat, but not on top of an emotion image.
+        if (lv_obj_get_child_cnt(content_) == 0 && emoji_label_ != nullptr &&
+            (emoji_image_ == nullptr || lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN))) {
             lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         }
         return;
@@ -875,8 +877,10 @@ void LcdDisplay::ClearChatMessages() {
     // Reset chat_message_label_ as it has been deleted
     chat_message_label_ = nullptr;
 
-    // Show the centered AI logo (emoji_label_) again
-    if (emoji_label_ != nullptr) {
+    // Show the centered AI logo (emoji_label_) again, unless an emotion image is on screen:
+    // both sit in the middle and would overlap.
+    if (emoji_label_ != nullptr &&
+        (emoji_image_ == nullptr || lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN))) {
         lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 

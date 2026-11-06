@@ -72,7 +72,7 @@ if(CONFIG_METAOS_ENABLE)
         "boards/common/sd_card.cc"
         "metaos/metaos.cc"
         "metaos/metaos_common.cc"
-        "metaos/metaos_hermes.cc"
+        "metaos/metaos_files.cc"
         "metaos/metaos_music.cc"
         "metaos/metaos_panel.cc"
         "metaos/metaos_reminders.cc"

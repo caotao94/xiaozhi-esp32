@@ -135,10 +135,6 @@ public:
     // Main task. Ends an open conversation when the device is listening or idle; it never
     // interrupts the assistant while it is speaking.
     void EndConversation();
-    // Main task. Starts a conversation from text instead of the wake word, so the assistant
-    // answers `text` aloud (used for spoken reminders and background-task results). Works only
-    // when the device is idle and the server accepts wake-word text; returns false otherwise.
-    bool InvokeWithText(const std::string& text);
 
     /**
      * Reset protocol resources (thread-safe)

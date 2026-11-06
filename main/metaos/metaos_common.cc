@@ -67,8 +67,8 @@ bool Storage::Ensure(bool force) {
         return false;
     }
     if (!folders_ready_) {
-        folders_ready_ = EnsureFolder(card_->mount_point() + "/" + kDataFolder) &&
-                         EnsureFolder(DataPath("hermes")) && EnsureFolder(MusicPath());
+        folders_ready_ =
+            EnsureFolder(card_->mount_point() + "/" + kDataFolder) && EnsureFolder(MusicPath());
     }
     return folders_ready_;
 }

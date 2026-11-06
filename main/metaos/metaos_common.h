@@ -18,8 +18,6 @@ enum class CardState {
 
 // Where MetaOS keeps its data on the SD card.
 //   <mount>/metaos/reminders.json pending reminders
-//   <mount>/metaos/hermes.json    Hermes endpoint config, written by the user
-//   <mount>/metaos/hermes/        archived Hermes results
 //   <mount>/music/                Ogg Opus files for local playback
 class Storage {
 public:
@@ -31,7 +29,7 @@ public:
     // Any task.
     bool IsMounted() const;
     CardState state() const;
-    // Absolute path below the MetaOS data folder, e.g. DataPath("hermes.json").
+    // Absolute path below the MetaOS data folder, e.g. DataPath("reminders.json").
     std::string DataPath(const char* name) const;
     std::string MusicPath() const;
     std::string MountPoint() const;

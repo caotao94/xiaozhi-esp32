@@ -13,7 +13,6 @@
 #include "display.h"
 #include "mcp_server.h"
 #include "metaos_common.h"
-#include "metaos_hermes.h"
 #include "metaos_music.h"
 #include "metaos_reminders.h"
 #include "metaos_strings.h"
@@ -27,11 +26,8 @@ namespace metaos {
 namespace {
 // NVS keys are persistent API: do not rename them.
 constexpr const char* kSettingsNamespace = "metaos";
+// Kept (unused for now) so the user's choice survives until spoken reminders return.
 constexpr const char* kKeySpeakReminders = "speak_remind";
-constexpr const char* kKeySpeakHermes = "speak_hermes";
-// Drop spoken announcements that could not be delivered within this time.
-constexpr int64_t kSpeechExpiryUs = 10LL * 60 * 1000 * 1000;
-constexpr size_t kMaxPendingSpeech = 3;
 
 // Plays a short sound unless it would interrupt the assistant or local music.
 void PlayAlertSound(const std::string_view& sound) {
@@ -50,15 +46,13 @@ bool HasLvglScreen() {
 MetaOs::MetaOs(SdmmcCard* card) : storage_(std::make_unique<Storage>(card)) {
     reminders_ = std::make_unique<ReminderStore>(*storage_);
     music_ = std::make_unique<MusicPlayer>(*storage_);
-    hermes_ = std::make_unique<HermesClient>(*storage_);
     panel_ = std::make_unique<MetaPanel>(
-        *storage_, *music_, *reminders_, *hermes_, settings_,
+        *storage_, *music_, *reminders_, settings_,
         MetaPanel::Hooks{
             .snooze = [this](const Reminder& reminder,
                              int minutes) { reminders_->Snooze(reminder, minutes); },
             .settings_changed = [this]() { SaveSettings(); },
             .retry_card = [this]() { RetryCard(); },
-            .speak_hermes_result = [this]() { SpeakHermesResult(); },
         });
 }
 
@@ -73,13 +67,11 @@ MetaOs::~MetaOs() {
 void MetaOs::LoadSettings() {
     Settings settings(kSettingsNamespace, false);
     settings_.speak_reminders = settings.GetBool(kKeySpeakReminders, true);
-    settings_.speak_hermes = settings.GetBool(kKeySpeakHermes, true);
 }
 
 void MetaOs::SaveSettings() {
     Settings settings(kSettingsNamespace, true);
     settings.SetBool(kKeySpeakReminders, settings_.speak_reminders);
-    settings.SetBool(kKeySpeakHermes, settings_.speak_hermes);
 }
 
 void MetaOs::Initialize() {
@@ -99,27 +91,9 @@ void MetaOs::Initialize() {
     } else {
         ESP_LOGW(TAG, "Running without an SD card");
     }
-    panel_->SetHermesConfigured(hermes_->IsConfigured());
 
     music_->SetFailedCallback([this](const std::string& title) {
         panel_->ShowToast(std::string(text::kPlayFailed) + ": " + title);
-    });
-    hermes_->SetFinishedCallback([this](const HermesClient::Snapshot& snapshot) {
-        if (snapshot.state == HermesClient::State::kCancelled) {
-            return;
-        }
-        bool done = snapshot.state == HermesClient::State::kDone;
-        if (HasLvglScreen()) {
-            panel_->ShowHermesAlert();
-        } else {
-            auto display = Board::GetInstance().GetDisplay();
-            display->ShowNotification(done ? text::kHermesDone : text::kHermesFailed, 10000);
-        }
-        if (done && settings_.speak_hermes) {
-            QueueSpeech(text::kSpeakHermesPrompt);
-        } else {
-            PlayAlertSound(done ? Lang::Sounds::OGG_POPUP : Lang::Sounds::OGG_EXCLAMATION);
-        }
     });
 
     RegisterTools();
@@ -144,7 +118,7 @@ void MetaOs::Initialize() {
     esp_timer_handle_t timer = nullptr;
     if (esp_timer_create(&args, &timer) == ESP_OK) {
         tick_timer_ = timer;
-        // Twice a second keeps the music and Hermes pages responsive.
+        // Twice a second keeps the music page responsive.
         esp_timer_start_periodic(timer, 500 * 1000);
     }
     ESP_LOGI(TAG, "MetaOS ready (SD card %s)", storage_->IsMounted() ? "mounted" : "missing");
@@ -165,7 +139,6 @@ void MetaOs::OnTick() {
     }
     FireReminders();
     music_->Tick();
-    SpeakPending();
     panel_->Refresh();
 }
 
@@ -175,7 +148,6 @@ void MetaOs::RetryCard() {
             reminders_->Load();
             storage_loaded_ = true;
         }
-        panel_->SetHermesConfigured(hermes_->IsConfigured());
     }
 }
 
@@ -200,91 +172,32 @@ void MetaOs::FireReminders() {
         display->ShowNotification(std::string(text::kReminderDue) + ": " + due.front().message,
                                   30000);
     }
+    // Spoken reminders need on-device TTS: the XiaoZhi protocol has no way to make the server
+    // say a given text (the wake-word "detect" message rejects long text).
     PlayAlertSound(Lang::Sounds::OGG_VIBRATION);
-    if (settings_.speak_reminders) {
-        std::string prompt = text::kSpeakReminderPrompt;
-        for (size_t i = 0; i < due.size(); ++i) {
-            prompt += (i == 0 ? "" : "; ") + due[i].message;
-        }
-        QueueSpeech(std::move(prompt));
-    }
 }
 
-void MetaOs::QueueSpeech(std::string prompt) {
-    if (pending_speech_.size() >= kMaxPendingSpeech) {
-        pending_speech_.erase(pending_speech_.begin());
-    }
-    pending_speech_.push_back(std::move(prompt));
-    speech_queued_us_ = esp_timer_get_time();
-    SpeakPending();
-}
-
-void MetaOs::SpeakPending() {
-    if (pending_speech_.empty()) {
-        return;
-    }
-    if (esp_timer_get_time() - speech_queued_us_ > kSpeechExpiryUs) {
-        ESP_LOGW(TAG, "Dropping %u undelivered announcement(s)",
-                 static_cast<unsigned>(pending_speech_.size()));
-        pending_speech_.clear();
-        return;
-    }
-    auto& app = Application::GetInstance();
-    if (app.GetDeviceState() != kDeviceStateIdle || app.IsLocalPlaybackActive()) {
-        return;
-    }
-    // Combine everything waiting into one request so it becomes one spoken answer.
-    std::string prompt;
-    for (const auto& item : pending_speech_) {
-        prompt += (prompt.empty() ? "" : "\n") + item;
-    }
-    if (app.InvokeWithText(prompt)) {
-        pending_speech_.clear();
-    }
-}
-
-void MetaOs::SpeakHermesResult() {
-    auto snapshot = hermes_->GetSnapshot(0);
-    if (snapshot.state != HermesClient::State::kDone) {
-        return;
-    }
-    auto& app = Application::GetInstance();
-    if (app.GetDeviceState() != kDeviceStateIdle) {
-        panel_->ShowToast(text::kBusy);
-        return;
-    }
-    panel_->Hide();
-    if (!app.InvokeWithText(text::kSpeakHermesPrompt)) {
-        panel_->ShowToast(text::kBusy);
-    }
-}
-
-void MetaOs::TogglePanel() {
-    if (!panel_->IsOpen()) {
-        panel_->SetHermesConfigured(hermes_->IsConfigured());
-    }
-    panel_->Toggle();
-}
+void MetaOs::TogglePanel() { panel_->Toggle(); }
 
 void MetaOs::RegisterTools() {
     auto& mcp = McpServer::GetInstance();
 
     // Reminders.
-    mcp.AddTool(
-        "self.reminder.add",
-        "Schedule a reminder. At the given time the device shows it on screen and, unless the "
-        "user turned this off, starts a conversation so you can say it aloud, even when no "
-        "conversation is open. Set either `in_minutes` (relative) or `at` as \"HH:MM\" (next "
-        "occurrence, local time) or \"YYYY-MM-DD HH:MM\". `daily` repeats it every day.",
-        PropertyList({Property("message", kPropertyTypeString).SetMaxLength(200),
-                      Property("in_minutes", kPropertyTypeInteger, 0, 0, 10080),
-                      Property("at", kPropertyTypeString, std::string()).SetMaxLength(16),
-                      Property("daily", kPropertyTypeBoolean, false)}),
-        [this](const PropertyList& properties) -> ToolResult {
-            return reminders_->Add(
-                properties["message"].value<std::string>(), properties["in_minutes"].value<int>(),
-                properties["at"].value<std::string>(), properties["daily"].value<bool>());
-        });
+    mcp.AddTool("self.reminder.add",
+                "Schedule a reminder. At the given time the device shows it on screen and plays an "
+                "alert sound; it does not speak the message. Set either `in_minutes` (relative) or "
+                "`at` as \"HH:MM\" (next occurrence, local time) or \"YYYY-MM-DD HH:MM\". `daily` "
+                "repeats it every day.",
+                PropertyList({Property("message", kPropertyTypeString).SetMaxLength(200),
+                              Property("in_minutes", kPropertyTypeInteger, 0, 0, 10080),
+                              Property("at", kPropertyTypeString, std::string()).SetMaxLength(16),
+                              Property("daily", kPropertyTypeBoolean, false)}),
+                [this](const PropertyList& properties) -> ToolResult {
+                    return reminders_->Add(properties["message"].value<std::string>(),
+                                           properties["in_minutes"].value<int>(),
+                                           properties["at"].value<std::string>(),
+                                           properties["daily"].value<bool>());
+                });
     mcp.AddTool("self.reminder.list", "List pending reminders with their ids.", PropertyList(),
                 [this](const PropertyList&) -> ToolResult { return reminders_->List(); });
     mcp.AddTool("self.reminder.cancel", "Cancel a reminder by id.",
@@ -327,35 +240,10 @@ void MetaOs::RegisterTools() {
                     return std::unexpected("Unknown action; use \"next\" or \"stop\"");
                 });
 
-    // Hermes Agent bridge.
-    mcp.AddTool(
-        "self.hermes.submit",
-        "Hand a task to Hermes Agent, a more capable assistant running on the user's server "
-        "with web research, files, code and other tools. Use it for multi-step work that "
-        "takes minutes (research, summaries, planning, computer tasks) or when the user "
-        "explicitly asks for Hermes. Describe the full task with all needed context in one "
-        "message, in the user's language. It runs in the background. When it finishes, the "
-        "device shows the result and starts a conversation asking you to read it.",
-        PropertyList({Property("task", kPropertyTypeString).SetMaxLength(1000)}),
-        [this](const PropertyList& properties) -> ToolResult {
-            return hermes_->Submit(properties["task"].value<std::string>());
-        });
-    mcp.AddTool("self.hermes.get_status",
-                "Get the state and, when done, the result of a Hermes task. `task_id` 0 means the "
-                "latest task. While it runs, `partial_result` holds the answer so far. Read the "
-                "result to the user in a few sentences.",
-                PropertyList({Property("task_id", kPropertyTypeInteger, 0, 0, 1000000)}),
-                [this](const PropertyList& properties) -> ToolResult {
-                    return hermes_->GetStatus(properties["task_id"].value<int>());
-                });
-    mcp.AddTool("self.hermes.cancel", "Stop waiting for the running Hermes task.", PropertyList(),
-                [this](const PropertyList&) -> ToolResult { return hermes_->Cancel(); });
-
     // Storage overview for the LLM and for diagnostics.
     mcp.AddTool(
         "self.storage.get_info",
-        "Report the SD card state and MetaOS data: free space, reminders, songs and whether "
-        "Hermes is configured.",
+        "Report the SD card state and MetaOS data: free space, reminders and songs.",
         PropertyList(), [this](const PropertyList&) -> ToolResult {
             CJsonUniquePtr json(cJSON_CreateObject());
             if (json == nullptr) {
@@ -377,7 +265,6 @@ void MetaOs::RegisterTools() {
                                     static_cast<double>(music_->tracks().size()));
             cJSON_AddNumberToObject(json.get(), "pending_reminders",
                                     static_cast<double>(reminders_->size()));
-            cJSON_AddBoolToObject(json.get(), "hermes_configured", hermes_->IsConfigured());
             cJSON_AddNumberToObject(
                 json.get(), "free_psram_kb",
                 static_cast<double>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));

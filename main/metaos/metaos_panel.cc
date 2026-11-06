@@ -19,7 +19,7 @@
 #include "board.h"
 #include "lvgl_theme.h"
 #include "metaos_common.h"
-#include "metaos_hermes.h"
+#include "metaos_files.h"
 #include "metaos_music.h"
 #include "metaos_strings.h"
 #else
@@ -42,8 +42,6 @@ namespace {
 constexpr int kLockTimeoutMs = 1000;
 constexpr int kToastMs = 2500;
 constexpr int kReminderAlertMs = 3 * 60 * 1000;
-constexpr int kHermesAlertMs = 60 * 1000;
-constexpr size_t kHermesPageTextBytes = 6 * 1024;
 constexpr size_t kTracksPerPage = 30;
 
 class LvglLock {
@@ -95,7 +93,8 @@ lv_color_t SecondaryText(LvglTheme* theme) {
 lv_obj_t* Box(lv_obj_t* parent) {
     lv_obj_t* box = lv_obj_create(parent);
     lv_obj_remove_style_all(box);
-    lv_obj_remove_flag(box, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_remove_flag(box,
+                       static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
     return box;
 }
 
@@ -119,16 +118,6 @@ std::string FormatDue(time_t due) {
     return FormatTime(due, "%m-%d ") + clock;
 }
 
-std::string FormatElapsed(int seconds) {
-    char buffer[16];
-    if (seconds < 60) {
-        snprintf(buffer, sizeof(buffer), "%ds", seconds);
-    } else {
-        snprintf(buffer, sizeof(buffer), "%dm%02ds", seconds / 60, seconds % 60);
-    }
-    return buffer;
-}
-
 std::string FormatUsage(uint64_t total, uint64_t free) {
     char buffer[48];
     snprintf(buffer, sizeof(buffer), "%s  %.1f / %.1f GB", text::kStorage,
@@ -149,15 +138,17 @@ void DispatchTap(lv_event_t* event) {
 }  // namespace
 
 MetaPanel::MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
-                     HermesClient& hermes, MetaSettings& settings, Hooks hooks)
+                     MetaSettings& settings, Hooks hooks)
     : storage_(storage),
       music_(music),
       reminders_(reminders),
-      hermes_(hermes),
+      file_browser_(
+          new FileBrowser(storage, {.on_file_changed = [this]() { Open(Page::kFiles); }})),
       settings_(settings),
       hooks_(std::move(hooks)) {}
 
 MetaPanel::~MetaPanel() {
+    delete file_browser_;
     LvglLock lock;
     if (lock) {
         CloseToast();
@@ -271,7 +262,8 @@ void* MetaPanel::AddHeader(const char* icon, const std::string& title) {
 
 void* MetaPanel::AddScrollArea() {
     lv_obj_t* area = Box(Obj(root_));
-    lv_obj_add_flag(area, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_add_flag(area,
+                    static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
     lv_obj_set_width(area, LV_PCT(100));
     lv_obj_set_flex_grow(area, 1);
     lv_obj_set_flex_flow(area, LV_FLEX_FLOW_COLUMN);
@@ -347,7 +339,10 @@ void MetaPanel::AddSwitchRow(void* parent, const std::string& text, bool value,
     lv_obj_t* label = lv_label_create(row);
     lv_label_set_text(label, text.c_str());
     lv_obj_t* toggle = lv_switch_create(row);
-    lv_obj_set_style_bg_color(toggle, Accent(), static_cast<lv_style_selector_t>(static_cast<uint32_t>(LV_PART_INDICATOR) | static_cast<uint32_t>(LV_STATE_CHECKED)));
+    lv_obj_set_style_bg_color(
+        toggle, Accent(),
+        static_cast<lv_style_selector_t>(static_cast<uint32_t>(LV_PART_INDICATOR) |
+                                         static_cast<uint32_t>(LV_STATE_CHECKED)));
     if (value) {
         lv_obj_add_state(toggle, LV_STATE_CHECKED);
     }
@@ -416,6 +411,9 @@ void MetaPanel::Hide() {
 }
 
 void MetaPanel::CloseLocked() {
+    // The text viewer's close button callback lives in page_buttons_, which is freed below, so
+    // the viewer must go first.
+    CloseFileViewer();
     if (root_ != nullptr) {
         // lv_obj_delete also drops the widgets' event callbacks, so no handler can run with a
         // freed Button afterwards.
@@ -427,14 +425,10 @@ void MetaPanel::CloseLocked() {
 }
 
 void MetaPanel::ClearPageRefs() {
-    title_label_ = nullptr;
-    status_label_ = nullptr;
-    body_label_ = nullptr;
     list_area_ = nullptr;
     for (auto& label : tile_labels_) {
         label = nullptr;
     }
-    shown_text_.clear();
 }
 
 void MetaPanel::Open(Page page) {
@@ -485,8 +479,8 @@ void MetaPanel::Open(Page page) {
         case Page::kReminders:
             BuildReminders();
             break;
-        case Page::kHermes:
-            BuildHermes();
+        case Page::kFiles:
+            BuildFiles();
             break;
         case Page::kSettings:
             BuildSettings();
@@ -533,8 +527,8 @@ void MetaPanel::RefreshLocked() {
                 Open(Page::kReminders);
             }
             break;
-        case Page::kHermes:
-            RefreshHermes();
+        case Page::kFiles:
+            // Files page doesn't need refresh
             break;
         case Page::kSettings:
             break;
@@ -564,21 +558,26 @@ void MetaPanel::RefreshHome() {
         const Reminder& next = reminders_.items().front();
         lines[1] = FormatTime(next.due, "%H:%M ") + next.message;
     }
-    // Hermes
-    auto snapshot = hermes_.GetSnapshot(0);
-    switch (snapshot.state) {
-        case HermesClient::State::kIdle:
-            lines[2] = text::kHermesIdle;
-            break;
-        case HermesClient::State::kRunning:
-            lines[2] = std::string(text::kRunning) + " " + FormatElapsed(snapshot.elapsed_seconds);
-            break;
-        case HermesClient::State::kDone:
-            lines[2] = text::kDone;
-            break;
-        default:
-            lines[2] = text::kFailed;
-            break;
+    // Files - show file count or card state
+    if (storage_.IsMounted()) {
+        std::vector<FileEntry> entries;
+        if (file_browser_->ListDirectory(file_browser_->current_path(), entries)) {
+            int file_count = 0, dir_count = 0;
+            for (const auto& entry : entries) {
+                if (entry.is_directory) {
+                    dir_count++;
+                } else {
+                    file_count++;
+                }
+            }
+            char buffer[64];
+            snprintf(buffer, sizeof(buffer), "%d 文件, %d 文件夹", file_count, dir_count);
+            lines[2] = buffer;
+        } else {
+            lines[2] = "无法访问";
+        }
+    } else {
+        lines[2] = text::kNoCard;
     }
     // Settings tile shows the card state.
     uint64_t total = 0, free = 0;
@@ -595,13 +594,12 @@ void MetaPanel::RefreshHome() {
 void MetaPanel::BuildHome() {
     AddHeader(nullptr, "MetaOS");
 
+    // 2x2 Grid layout
     lv_obj_t* grid = Box(Obj(root_));
-    lv_obj_set_width(grid, LV_PCT(100));
+    lv_obj_set_size(grid, LV_PCT(100), LV_PCT(100));
     lv_obj_set_flex_grow(grid, 1);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_SPACE_BETWEEN);
-    lv_obj_set_style_pad_row(grid, 8, 0);
+    lv_obj_set_style_pad_gap(grid, 4, 0);
 
     struct Tile {
         const char* icon;
@@ -612,38 +610,45 @@ void MetaPanel::BuildHome() {
     const Tile tiles[4] = {
         {MATERIAL_SYMBOLS_MUSIC_NOTE, text::kMusic, Page::kMusic, 0x8E24AA},
         {MATERIAL_SYMBOLS_ALARM, text::kReminders, Page::kReminders, 0xF4511E},
-        {MATERIAL_SYMBOLS_ROBOT_2, "Hermes", Page::kHermes, 0x1E88E5},
+        {MATERIAL_SYMBOLS_SD_CARD, "文件", Page::kFiles, 0x43A047},
         {MATERIAL_SYMBOLS_SETTINGS, text::kSettings, Page::kSettings, 0x546E7A},
     };
+
     for (int i = 0; i < 4; ++i) {
         lv_color_t color = lv_color_hex(tiles[i].color);
         lv_obj_t* tile = Box(grid);
+
+        // Each tile is 50% width minus gap, auto height
         lv_obj_set_size(tile, LV_PCT(48), LV_PCT(48));
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(tile, color, 0);
         lv_obj_set_style_bg_color(tile, lv_color_mix(color, lv_color_black(), 160),
                                   LV_STATE_PRESSED);
         lv_obj_set_style_radius(tile, 14, 0);
-        lv_obj_set_style_pad_all(tile, 10, 0);
+        lv_obj_set_style_pad_all(tile, 8, 0);
         lv_obj_set_style_text_color(tile, lv_color_white(), 0);
         lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START,
                               LV_FLEX_ALIGN_START);
 
+        // Top row: icon + title
         lv_obj_t* top = Box(tile);
         lv_obj_set_size(top, LV_PCT(100), LV_SIZE_CONTENT);
         lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(top, 6, 0);
+        lv_obj_set_style_pad_column(top, 4, 0);
+
         lv_obj_t* icon = lv_label_create(top);
         lv_label_set_text(icon, tiles[i].icon);
         lv_obj_set_style_text_font(icon, theme_->icon_font()->font(), 0);
+
         lv_obj_t* title = lv_label_create(top);
         lv_label_set_text(title, tiles[i].title);
 
+        // Bottom line: status text (single line, truncate with dots)
         lv_obj_t* line = lv_label_create(tile);
         lv_obj_set_width(line, LV_PCT(100));
-        lv_label_set_long_mode(line, LV_LABEL_LONG_MODE_DOTS);
+        lv_label_set_long_mode(line, LV_LABEL_LONG_CLIP);
         lv_label_set_text(line, "");
         lv_obj_set_style_text_opa(line, LV_OPA_80, 0);
         tile_labels_[i] = line;
@@ -786,92 +791,119 @@ void MetaPanel::BuildReminders() {
     }
 }
 
-void MetaPanel::RefreshHermes() {
-    unsigned revision = hermes_.revision();
-    if (revision == shown_revision_) {
-        // Only the elapsed time moves; update it in place.
-        auto snapshot = hermes_.GetSnapshot(0);
-        if (snapshot.state == HermesClient::State::kRunning) {
-            SetLabel(status_label_, HermesStatus(snapshot));
-        }
-        return;
+void MetaPanel::BuildFiles() {
+    // Breadcrumb header showing current path
+    auto crumbs = file_browser_->GetBreadcrumbs();
+    std::string title;
+    if (crumbs.size() <= 1) {
+        title = "文件";
+    } else {
+        title = crumbs.back();
     }
-    auto snapshot = hermes_.GetSnapshot(kHermesPageTextBytes);
-    if (snapshot.state == HermesClient::State::kRunning && body_label_ != nullptr &&
-        status_label_ != nullptr) {
-        // New text arrived: update the labels without rebuilding, so scrolling is kept.
-        shown_revision_ = revision;
-        SetLabel(status_label_, HermesStatus(snapshot));
-        if (snapshot.text != shown_text_) {
-            shown_text_ = snapshot.text;
-            lv_label_set_text(Obj(body_label_), shown_text_.c_str());
-        }
-        return;
-    }
-    Open(Page::kHermes);
-}
+    AddHeader(MATERIAL_SYMBOLS_SD_CARD, title);
 
-std::string MetaPanel::HermesStatus(const HermesClient::Snapshot& snapshot) {
-    std::string status;
-    switch (snapshot.state) {
-        case HermesClient::State::kRunning:
-            status = text::kRunning;
-            break;
-        case HermesClient::State::kDone:
-            status = text::kDone;
-            break;
-        default:
-            status = text::kFailed;
-            break;
-    }
-    status += " · " + FormatElapsed(snapshot.elapsed_seconds);
-    if (snapshot.tool_steps > 0) {
-        status += " · " + std::to_string(snapshot.tool_steps) + " " + text::kSteps;
-    }
-    return status;
-}
-
-void MetaPanel::BuildHermes() {
-    shown_revision_ = hermes_.revision();
-    AddHeader(MATERIAL_SYMBOLS_ROBOT_2, "Hermes");
     lv_obj_t* area = Obj(AddScrollArea());
     list_area_ = area;
-    auto snapshot = hermes_.GetSnapshot(kHermesPageTextBytes);
 
-    if (snapshot.state == HermesClient::State::kIdle) {
-        AddLabel(area, hermes_configured_ ? text::kHermesIdle : text::kHermesNotConfigured);
-        AddLabel(area, text::kHermesHint, true);
+    if (!storage_.IsMounted()) {
+        AddLabel(area, text::kNoCard);
+        AddTextButton(area, text::kRetry, [this]() { hooks_.retry_card(); });
         return;
     }
 
-    lv_obj_t* task = Obj(AddLabel(area, snapshot.task, true));
-    lv_label_set_long_mode(task, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_style_max_height(task, 48, 0);
-    status_label_ = AddLabel(area, HermesStatus(snapshot));
-    lv_obj_set_style_text_color(Obj(status_label_),
-                                snapshot.state == HermesClient::State::kRunning ? Accent()
-                                : snapshot.state == HermesClient::State::kDone
-                                    ? lv_color_hex(0x43A047)
-                                    : lv_color_hex(0xE53935),
-                                0);
-    shown_text_ = snapshot.text;
-    body_label_ = AddLabel(area, shown_text_);
-    if (snapshot.truncated && snapshot.state != HermesClient::State::kRunning) {
-        AddLabel(area, text::kTruncated, true);
+    // Breadcrumb navigation if not at root
+    if (crumbs.size() > 1) {
+        lv_obj_t* breadcrumb = Box(area);
+        lv_obj_set_width(breadcrumb, LV_PCT(100));
+        lv_obj_set_style_pad_all(breadcrumb, 8, 0);
+        lv_obj_set_flex_flow(breadcrumb, LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_style_pad_column(breadcrumb, 4, 0);
+
+        for (size_t i = 0; i < crumbs.size(); ++i) {
+            if (i > 0) {
+                AddLabel(breadcrumb, "/", true);
+            }
+            if (i == crumbs.size() - 1) {
+                // Current folder - not clickable
+                AddLabel(breadcrumb, crumbs[i]);
+            } else {
+                // Clickable parent folder
+                lv_obj_t* link = Obj(AddLabel(breadcrumb, crumbs[i]));
+                lv_obj_set_style_text_color(link, lv_color_hex(0x2196F3), 0);
+                AttachTap(link, [this, i]() {
+                    // Navigate to this level
+                    std::string path = storage_.MountPoint();
+                    auto crumbs = file_browser_->GetBreadcrumbs();
+                    for (size_t j = 1; j <= i; ++j) {
+                        path += "/" + crumbs[j];
+                    }
+                    if (file_browser_->NavigateTo(path)) {
+                        Open(Page::kFiles);
+                    }
+                });
+            }
+        }
     }
 
-    lv_obj_t* bar = Obj(AddButtonBar());
-    if (snapshot.state == HermesClient::State::kRunning) {
-        AddTextButton(bar, text::kStop, [this]() { hermes_.Cancel(); });
-    } else if (snapshot.state == HermesClient::State::kDone) {
-        AddTextButton(
-            bar, text::kRead,
-            [this]() {
-                if (hooks_.speak_hermes_result) {
-                    hooks_.speak_hermes_result();
+    // List files and directories
+    std::vector<FileEntry> entries;
+    if (!file_browser_->ListDirectory(file_browser_->current_path(), entries)) {
+        AddLabel(area, "无法读取目录");
+        return;
+    }
+
+    if (entries.empty()) {
+        AddLabel(area, "空文件夹", true);
+        return;
+    }
+
+    // Add parent directory link if not at root
+    if (crumbs.size() > 1) {
+        AddListRow(area, MATERIAL_SYMBOLS_ARROW_UPWARD, "..", "", [this]() {
+            if (file_browser_->NavigateUp()) {
+                Open(Page::kFiles);
+            }
+        });
+    }
+
+    // Show each file/directory
+    for (const auto& entry : entries) {
+        std::string detail;
+        const char* icon;
+
+        if (entry.is_directory) {
+            icon = MATERIAL_SYMBOLS_SD_CARD;  // Use SD_CARD icon for folders
+            detail = "";
+        } else {
+            icon = MATERIAL_SYMBOLS_IMAGE;  // Default file icon
+            detail = FileBrowser::FormatFileSize(entry.size);
+
+            // Special icons for known file types
+            if (FileBrowser::IsImageFile(entry.name)) {
+                icon = MATERIAL_SYMBOLS_IMAGE;
+            } else if (FileBrowser::IsTextFile(entry.name)) {
+                icon = MATERIAL_SYMBOLS_EDIT_SQUARE;  // Use edit icon for text files
+            }
+        }
+
+        std::string full_path = file_browser_->current_path() + "/" + entry.name;
+
+        AddListRow(area, icon, entry.name, detail, [this, entry, full_path]() {
+            if (entry.is_directory) {
+                // Navigate into directory
+                if (file_browser_->NavigateTo(full_path)) {
+                    Open(Page::kFiles);
                 }
-            },
-            true);
+            } else if (FileBrowser::IsImageFile(entry.name)) {
+                // No image decoding path yet (see README_metaos.md).
+                ShowToast("暂不支持查看图片");
+            } else if (FileBrowser::IsTextFile(entry.name)) {
+                ShowTextViewer(full_path);
+            } else {
+                // Unknown file type
+                ShowToast("不支持的文件类型");
+            }
+        });
     }
 }
 
@@ -894,18 +926,6 @@ void MetaPanel::BuildSettings() {
             }
         });
     }
-    AddSwitchRow(area, text::kSpeakReminders, settings_.speak_reminders, [this](bool on) {
-        settings_.speak_reminders = on;
-        if (hooks_.settings_changed) {
-            hooks_.settings_changed();
-        }
-    });
-    AddSwitchRow(area, text::kSpeakHermes, settings_.speak_hermes, [this](bool on) {
-        settings_.speak_hermes = on;
-        if (hooks_.settings_changed) {
-            hooks_.settings_changed();
-        }
-    });
 
     // Card state with a retry button.
     std::string card;
@@ -968,7 +988,8 @@ void MetaPanel::OpenAlert(const char* icon, const std::string& title, const std:
 
     // The body scrolls when it is longer than the screen.
     lv_obj_t* body_area = Box(card);
-    lv_obj_add_flag(body_area, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_add_flag(body_area,
+                    static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
     lv_obj_set_width(body_area, LV_PCT(100));
     lv_obj_set_height(body_area, LV_SIZE_CONTENT);
     lv_obj_set_style_max_height(body_area, 120, 0);
@@ -1026,39 +1047,6 @@ void MetaPanel::ShowReminderAlert(const std::vector<Reminder>& due) {
         ShowToast(text::kSnoozed);
     });
     AddTextButton(alert_bar_, text::kGotIt, [this]() { CloseAlert(); }, true);
-    building_buttons_ = &page_buttons_;
-}
-
-void MetaPanel::ShowHermesAlert() {
-    LvglLock lock;
-    if (!lock) {
-        return;
-    }
-    theme_ = CurrentTheme();
-    if (theme_ == nullptr) {
-        return;
-    }
-    auto snapshot = hermes_.GetSnapshot(1200);
-    bool done = snapshot.state == HermesClient::State::kDone;
-    std::string body = snapshot.text;
-    if (snapshot.truncated) {
-        body += "...";
-    }
-    OpenAlert(MATERIAL_SYMBOLS_ROBOT_2, done ? text::kHermesDone : text::kHermesFailed, body,
-              kHermesAlertMs);
-    alert_reminders_.clear();
-    AddTextButton(alert_bar_, text::kClose, [this]() { CloseAlert(); });
-    AddTextButton(
-        alert_bar_, done ? text::kRead : "Hermes",
-        [this, done]() {
-            CloseAlert();
-            if (done && hooks_.speak_hermes_result) {
-                hooks_.speak_hermes_result();
-            } else {
-                Open(Page::kHermes);
-            }
-        },
-        true);
     building_buttons_ = &page_buttons_;
 }
 
@@ -1139,16 +1127,126 @@ void MetaPanel::CloseToast() {
     }
 }
 
+void MetaPanel::ShowTextViewer(const std::string& path) {
+    LvglLock lock;
+    if (!lock) {
+        return;
+    }
+    theme_ = CurrentTheme();
+    if (theme_ == nullptr) {
+        return;
+    }
+
+    CloseFileViewer();
+    viewing_file_ = path;
+
+    // Read file content
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) {
+        ShowToast("无法打开文件");
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    // Limit to 64KB for memory safety
+    if (size > 65536) {
+        fclose(f);
+        ShowToast("文件太大");
+        return;
+    }
+
+    std::string content;
+    content.resize(size);
+    size_t read = fread(&content[0], 1, size, f);
+    fclose(f);
+
+    if (read != static_cast<size_t>(size)) {
+        ShowToast("读取失败");
+        return;
+    }
+
+    // Full-screen viewer on the top layer, above the panel (the panel root lives there too, so
+    // the viewer must be created after it to be drawn on top).
+    lv_obj_t* viewer = lv_obj_create(lv_layer_top());
+    file_viewer_ = viewer;
+    lv_obj_remove_style_all(viewer);
+    lv_obj_set_size(viewer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(viewer, theme_->background_color(), 0);
+    lv_obj_set_style_bg_opa(viewer, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(viewer, 8, 0);
+    lv_obj_set_style_pad_row(viewer, 6, 0);
+    lv_obj_set_flex_flow(viewer, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(viewer, LV_OBJ_FLAG_SCROLLABLE);
+    // Not a child of root_, so the theme font and color must be set here; the default font has
+    // no Chinese glyphs.
+    lv_obj_set_style_text_font(viewer, theme_->text_font()->font(), 0);
+    lv_obj_set_style_text_color(viewer, theme_->text_color(), 0);
+    // Taps must not fall through to the panel underneath.
+    lv_obj_add_flag(viewer, LV_OBJ_FLAG_CLICKABLE);
+
+    // Header: file name, then a close button that stays visible however long the name is.
+    lv_obj_t* header = Box(viewer);
+    lv_obj_set_size(header, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 6, 0);
+
+    size_t last_slash = path.find_last_of('/');
+    std::string filename = (last_slash != std::string::npos) ? path.substr(last_slash + 1) : path;
+    lv_obj_t* name = lv_label_create(header);
+    lv_label_set_text(name, filename.c_str());
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_flex_grow(name, 1);
+    AddIconButton(header, MATERIAL_SYMBOLS_CLOSE, [this]() { CloseFileViewer(); });
+
+    // Read-only text: a plain label in a scrollable box, no text area or keyboard.
+    lv_obj_t* scroll_area = Box(viewer);
+    lv_obj_add_flag(scroll_area,
+                    static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_set_width(scroll_area, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll_area, 1);
+    lv_obj_set_scroll_dir(scroll_area, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(scroll_area, LV_SCROLLBAR_MODE_ACTIVE);
+
+    lv_obj_t* text_label = lv_label_create(scroll_area);
+    lv_obj_set_width(text_label, LV_PCT(100));
+    lv_label_set_long_mode(text_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(text_label, content.empty() ? "(空文件)" : content.c_str());
+
+    // Alerts and toasts stay above the viewer.
+    if (alert_ != nullptr) {
+        lv_obj_move_foreground(Obj(alert_));
+    }
+    if (toast_ != nullptr) {
+        lv_obj_move_foreground(Obj(toast_));
+    }
+}
+
+// Main task. Takes the (recursive) LVGL lock: the close button calls this without it.
+void MetaPanel::CloseFileViewer() {
+    if (file_viewer_ == nullptr) {
+        return;
+    }
+    LvglLock lock;
+    if (lock && file_viewer_ != nullptr) {
+        lv_obj_delete(Obj(file_viewer_));
+        file_viewer_ = nullptr;
+        viewing_file_.clear();
+    }
+}
+
 #else  // !METAOS_PANEL_ENABLED
 
 struct MetaPanel::Button {};
 
 MetaPanel::MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
-                     HermesClient& hermes, MetaSettings& settings, Hooks hooks)
+                     MetaSettings& settings, Hooks hooks)
     : storage_(storage),
       music_(music),
       reminders_(reminders),
-      hermes_(hermes),
       settings_(settings),
       hooks_(std::move(hooks)) {}
 MetaPanel::~MetaPanel() = default;
@@ -1157,7 +1255,6 @@ void MetaPanel::Open(Page) {}
 void MetaPanel::Hide() {}
 void MetaPanel::Refresh() {}
 void MetaPanel::ShowReminderAlert(const std::vector<Reminder>&) {}
-void MetaPanel::ShowHermesAlert() {}
 void MetaPanel::CloseAlert() {}
 void MetaPanel::ShowToast(const std::string&) {}
 

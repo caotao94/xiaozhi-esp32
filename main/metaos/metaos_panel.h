@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 
-#include "metaos_hermes.h"
 #include "metaos_reminders.h"
 
 class LvglTheme;
@@ -15,15 +14,15 @@ namespace metaos {
 
 class MusicPlayer;
 class Storage;
+class FileBrowser;
 
 // User settings shown on the settings page. They live in NVS ("metaos" namespace).
 struct MetaSettings {
     bool speak_reminders = true;
-    bool speak_hermes = true;
 };
 
 // Touch UI on the LVGL top layer: a home screen with four tiles and one page each for music,
-// reminders, Hermes and settings, plus alert dialogs for reminders and Hermes results.
+// reminders, files and settings, plus alert dialogs for reminders.
 //
 // Widgets exist only while a screen is open, so a later font or theme change never leaves
 // them with a stale font pointer. Every public method runs in the main task and takes the
@@ -33,19 +32,18 @@ struct MetaSettings {
 // Without LVGL (OLED, e-paper, emote display) every method is a no-op.
 class MetaPanel {
 public:
-    enum class Page { kHome, kMusic, kReminders, kHermes, kSettings };
+    enum class Page { kHome, kMusic, kReminders, kFiles, kSettings };
 
     struct Hooks {
         // Main task. Actions that belong to MetaOs.
         std::function<void(const Reminder& reminder, int minutes)> snooze;
         std::function<void()> settings_changed;
         std::function<void()> retry_card;
-        std::function<void()> speak_hermes_result;
     };
 
     struct Button;
 
-    MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders, HermesClient& hermes,
+    MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
               MetaSettings& settings, Hooks hooks);
     ~MetaPanel();
 
@@ -58,13 +56,10 @@ public:
     bool IsOpen() const { return root_ != nullptr; }
     // Main task, about twice a second: refreshes what is on screen.
     void Refresh();
-    // Shown on the Hermes page when no task has run yet.
-    void SetHermesConfigured(bool configured) { hermes_configured_ = configured; }
 
     // Alert dialogs above everything else. They stay until a button is tapped or they
     // time out (conversations don't auto-close them).
     void ShowReminderAlert(const std::vector<Reminder>& due);
-    void ShowHermesAlert();
     void CloseAlert();
     bool IsAlertOpen() const { return alert_ != nullptr; }
     // Short message at the bottom of the screen, also shown without the panel.
@@ -91,18 +86,22 @@ private:
     void AddSliderRow(void* parent, const char* icon, int value,
                       std::function<void(int)> on_change);
     static void SetLabel(void* label, const std::string& text);
-    static std::string HermesStatus(const HermesClient::Snapshot& snapshot);
 
     void CloseLocked();
     void ClearPageRefs();
     void BuildHome();
     void BuildMusic();
     void BuildReminders();
-    void BuildHermes();
+    void BuildFiles();
     void BuildSettings();
     void RefreshLocked();
     void RefreshHome();
-    void RefreshHermes();
+
+    // File viewer/editor sub-pages
+    // Read-only text viewer above the panel. Closed with the panel.
+    void ShowTextViewer(const std::string& path);
+    void CloseFileViewer();
+
     void OpenAlert(const char* icon, const std::string& title, const std::string& body,
                    int timeout_ms);
     void CloseAlertLocked();
@@ -111,10 +110,9 @@ private:
     Storage& storage_;
     MusicPlayer& music_;
     ReminderStore& reminders_;
-    HermesClient& hermes_;
+    FileBrowser* file_browser_;
     MetaSettings& settings_;
     Hooks hooks_;
-    bool hermes_configured_ = false;
 
     LvglTheme* theme_ = nullptr;
     // Touch callbacks referenced by LVGL event user data. Freed after their widgets.
@@ -125,14 +123,14 @@ private:
     Page page_ = Page::kHome;
     void* root_ = nullptr;
     // Widgets that Refresh() updates on the current page.
-    void* title_label_ = nullptr;
-    void* status_label_ = nullptr;
-    void* body_label_ = nullptr;
     void* list_area_ = nullptr;
     void* tile_labels_[4] = {};
     unsigned shown_revision_ = 0;
-    std::string shown_text_;
     size_t list_offset_ = 0;
+
+    // File viewer state
+    void* file_viewer_ = nullptr;
+    std::string viewing_file_;
 
     void* alert_ = nullptr;
     void* alert_bar_ = nullptr;

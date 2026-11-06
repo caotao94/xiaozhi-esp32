@@ -1241,26 +1241,6 @@ bool Application::CanStartLocalPlayback() const {
            (!protocol_ || !protocol_->IsAudioChannelOpened());
 }
 
-bool Application::InvokeWithText(const std::string& text) {
-    if (GetDeviceState() != kDeviceStateIdle) {
-        return false;
-    }
-    // Sanitize: the text gets embedded into a JSON string, so control chars, quotes and
-    // backslashes must be replaced to avoid breaking the protocol message.
-    std::string sanitized;
-    for (char ch : text) {
-        if (ch == '"' || ch == '\\') {
-            sanitized += ' ';
-        } else if (ch < 0x20 && ch != '\t') {
-            sanitized += ' ';
-        } else {
-            sanitized += ch;
-        }
-    }
-    WakeWordInvoke(sanitized);
-    return true;
-}
-
 void Application::EndConversation() {
     auto state = GetDeviceState();
     if (protocol_ && protocol_->IsAudioChannelOpened() &&
