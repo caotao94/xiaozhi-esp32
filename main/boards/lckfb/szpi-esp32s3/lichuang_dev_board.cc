@@ -1,24 +1,25 @@
-#include "wifi_board.h"
-#include "codecs/box_audio_codec.h"
-#include "display/lcd_display.h"
-#include "display/emote_display.h"
 #include "application.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
 #include "config.h"
-#include "i2c_device.h"
+#include "display/emote_display.h"
+#include "display/lcd_display.h"
 #include "esp32_camera.h"
+#include "i2c_device.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
+#include "wifi_board.h"
 #if CONFIG_METAOS_ENABLE
 #include "metaos.h"
+#include "qmi8658.h"
 #include "sd_card.h"
 #endif
 
-#include <esp_log.h>
-#include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <esp_lcd_panel_vendor.h>
 #include <esp_lcd_touch_ft5x06.h>
+#include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 
@@ -74,6 +75,7 @@ private:
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
 #if CONFIG_METAOS_ENABLE
     SdmmcCard* sd_card_ = nullptr;
+    Qmi8658* imu_ = nullptr;
     metaos::MetaOs* metaos_ = nullptr;
 #endif
 
@@ -87,9 +89,10 @@ private:
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
             .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
 
@@ -111,7 +114,8 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
+            // During startup (before connected), pressing BOOT button enters Wi-Fi config mode
+            // without reboot
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
@@ -177,7 +181,7 @@ private:
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
-        
+
         esp_lcd_panel_reset(panel);
         pca9557_->SetOutputState(0, 0);
 
@@ -190,28 +194,30 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new SpiLcdDisplay(panel_io, panel,
-            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
     }
 
-    void InitializeTouch()
-    {
+    void InitializeTouch() {
         esp_lcd_touch_handle_t tp = nullptr;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_HEIGHT,
             .y_max = DISPLAY_WIDTH,
-            .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
-            .int_gpio_num = GPIO_NUM_NC, 
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
-                .mirror_y = 0,
-            },
+            .rst_gpio_num = GPIO_NUM_NC,  // Shared with LCD reset
+            .int_gpio_num = GPIO_NUM_NC,
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 1,
+                    .mirror_x = 1,
+                    .mirror_y = 0,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = {
@@ -219,11 +225,9 @@ private:
             .control_phase_bytes = 1,
             .dc_bit_offset = 0,
             .lcd_cmd_bits = 8,
-            .flags =
-            {
+            .flags = {
                 .disable_control_phase = 1,
-            }
-        };
+            }};
         tp_io_config.scl_speed_hz = 400000;
 
         if (esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle) != ESP_OK) {
@@ -238,11 +242,11 @@ private:
 
         /* Add touch input (for selected screen) */
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = lv_display_get_default(),
             .handle = tp,
         };
 
-        if(touch_cfg.disp) {
+        if (touch_cfg.disp) {
             lvgl_port_add_touch(&touch_cfg);
         } else {
             ESP_LOGE(TAG, "Touch display is not initialized");
@@ -285,14 +289,14 @@ private:
     }
 
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
-            });
+                           "End this conversation and enter WiFi configuration mode.\n"
+                           "**CAUTION** You must ask the user to confirm this action.",
+                           PropertyList(), [this](const PropertyList& properties) {
+                               EnterWifiConfigMode();
+                               return true;
+                           });
 
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
@@ -305,7 +309,9 @@ private:
             .cmd = SD_CARD_PIN_CMD,
             .d0 = SD_CARD_PIN_D0,
         });
-        metaos_ = new metaos::MetaOs(sd_card_);
+        // Probe for IMU sensor
+        imu_ = Qmi8658::Probe(i2c_bus_);
+        metaos_ = new metaos::MetaOs(sd_card_, imu_);
         metaos_->Initialize();
 #endif
     }
@@ -324,24 +330,18 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static CustomAudioCodec audio_codec(
-            i2c_bus_, 
-            pca9557_);
+        static CustomAudioCodec audio_codec(i2c_bus_, pca9557_);
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
-    
+    virtual Display* GetDisplay() override { return display_; }
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
     }
 
-    virtual Camera* GetCamera() override {
-        return camera_;
-    }
+    virtual Camera* GetCamera() override { return camera_; }
 };
 
 DECLARE_BOARD(LichuangDevBoard);

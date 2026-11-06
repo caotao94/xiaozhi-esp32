@@ -13,9 +13,11 @@
 #include "display.h"
 #include "mcp_server.h"
 #include "metaos_common.h"
+#include "metaos_motion.h"
 #include "metaos_music.h"
 #include "metaos_reminders.h"
 #include "metaos_strings.h"
+#include "qmi8658.h"
 #include "sd_card.h"
 #include "settings.h"
 
@@ -28,6 +30,8 @@ namespace {
 constexpr const char* kSettingsNamespace = "metaos";
 // Kept (unused for now) so the user's choice survives until spoken reminders return.
 constexpr const char* kKeySpeakReminders = "speak_remind";
+constexpr const char* kKeyShakeNext = "shake_next";
+constexpr const char* kKeyFlipStop = "flip_stop";
 
 // Plays a short sound unless it would interrupt the assistant or local music.
 void PlayAlertSound(const std::string_view& sound) {
@@ -43,7 +47,8 @@ bool HasLvglScreen() {
 }
 }  // namespace
 
-MetaOs::MetaOs(SdmmcCard* card) : storage_(std::make_unique<Storage>(card)) {
+MetaOs::MetaOs(SdmmcCard* card, Qmi8658* imu)
+    : storage_(std::make_unique<Storage>(card)), imu_(imu) {
     reminders_ = std::make_unique<ReminderStore>(*storage_);
     music_ = std::make_unique<MusicPlayer>(*storage_);
     panel_ = std::make_unique<MetaPanel>(
@@ -54,9 +59,15 @@ MetaOs::MetaOs(SdmmcCard* card) : storage_(std::make_unique<Storage>(card)) {
             .settings_changed = [this]() { SaveSettings(); },
             .retry_card = [this]() { RetryCard(); },
         });
+    if (imu_ != nullptr) {
+        motion_ = std::make_unique<MotionDetector>(imu_);
+    }
 }
 
 MetaOs::~MetaOs() {
+    if (motion_ != nullptr) {
+        motion_->Stop();
+    }
     if (tick_timer_ != nullptr) {
         auto timer = static_cast<esp_timer_handle_t>(tick_timer_);
         esp_timer_stop(timer);
@@ -67,11 +78,23 @@ MetaOs::~MetaOs() {
 void MetaOs::LoadSettings() {
     Settings settings(kSettingsNamespace, false);
     settings_.speak_reminders = settings.GetBool(kKeySpeakReminders, true);
+    settings_.shake_next = settings.GetBool(kKeyShakeNext, false);
+    settings_.flip_stop = settings.GetBool(kKeyFlipStop, false);
 }
 
 void MetaOs::SaveSettings() {
     Settings settings(kSettingsNamespace, true);
     settings.SetBool(kKeySpeakReminders, settings_.speak_reminders);
+    settings.SetBool(kKeyShakeNext, settings_.shake_next);
+    settings.SetBool(kKeyFlipStop, settings_.flip_stop);
+
+    // Update motion detector if active
+    if (motion_ != nullptr) {
+        MotionDetector::Settings motion_settings;
+        motion_settings.shake_enabled = settings_.shake_next;
+        motion_settings.flip_enabled = settings_.flip_stop;
+        motion_->UpdateSettings(motion_settings);
+    }
 }
 
 void MetaOs::Initialize() {
@@ -95,6 +118,32 @@ void MetaOs::Initialize() {
     music_->SetFailedCallback([this](const std::string& title) {
         panel_->ShowToast(std::string(text::kPlayFailed) + ": " + title);
     });
+
+    // Start motion detection if IMU is available
+    if (motion_ != nullptr) {
+        MotionDetector::Settings motion_settings;
+        motion_settings.shake_enabled = settings_.shake_next;
+        motion_settings.flip_enabled = settings_.flip_stop;
+        motion_->Start(MotionDetector::Callbacks{
+                           .on_shake =
+                               [this]() {
+                                   if (music_->IsPlaying()) {
+                                       music_->SkipNext();
+                                       panel_->ShowToast("已切歌");
+                                   }
+                               },
+                           .on_flip_over =
+                               [this]() {
+                                   if (music_->IsPlaying()) {
+                                       music_->StopPlayback();
+                                       panel_->ShowToast("已停止");
+                                   } else if (panel_->IsAlertOpen()) {
+                                       panel_->CloseAlert();
+                                   }
+                               },
+                       },
+                       motion_settings);
+    }
 
     RegisterTools();
 
@@ -270,6 +319,26 @@ void MetaOs::RegisterTools() {
                 static_cast<double>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
             return ReturnValue(std::in_place_type<cJSON*>, json.release());
         });
+
+    // Motion sensor state (if available)
+    if (motion_ != nullptr) {
+        mcp.AddTool("self.motion.get_state",
+                    "Get IMU motion sensor state: accelerometer readings (in milligravity), "
+                    "orientation (lying_flat), and motion detection (moving).",
+                    PropertyList(), [this](const PropertyList&) -> ToolResult {
+                        auto state = motion_->GetState();
+                        CJsonUniquePtr json(cJSON_CreateObject());
+                        if (json == nullptr) {
+                            return std::unexpected("Out of memory");
+                        }
+                        cJSON_AddNumberToObject(json.get(), "accel_x_mg", state.accel_x_mg);
+                        cJSON_AddNumberToObject(json.get(), "accel_y_mg", state.accel_y_mg);
+                        cJSON_AddNumberToObject(json.get(), "accel_z_mg", state.accel_z_mg);
+                        cJSON_AddBoolToObject(json.get(), "lying_flat", state.lying_flat);
+                        cJSON_AddBoolToObject(json.get(), "moving", state.moving);
+                        return ReturnValue(std::in_place_type<cJSON*>, json.release());
+                    });
+    }
 }
 
 }  // namespace metaos

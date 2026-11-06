@@ -36,6 +36,14 @@ inline constexpr const char* kSnoozed = "10 分钟后再提醒";
 inline constexpr const char* kStorage = "TF 卡";
 inline constexpr const char* kRetry = "重新检测";
 inline constexpr const char* kVoiceHint = "长按 BOOT 键打开或关闭此界面";
+inline constexpr const char* kFiles = "文件";
+inline constexpr const char* kLoading = "加载中...";
+inline constexpr const char* kImageLoadFailed = "图片加载失败";
+inline constexpr const char* kUnsupportedFormat = "不支持的格式";
+inline constexpr const char* kShakeNext = "摇一摇切歌";
+inline constexpr const char* kFlipStop = "翻转停止";
+inline constexpr const char* kSpeakReminders = "提醒语音播报";
+inline constexpr const char* kVoiceDataMissing = "缺少语音数据文件";
 #else
 inline constexpr const char* kMusic = "Music";
 inline constexpr const char* kReminders = "Reminders";
@@ -64,6 +72,14 @@ inline constexpr const char* kSnoozed = "Snoozed for 10 minutes";
 inline constexpr const char* kStorage = "TF card";
 inline constexpr const char* kRetry = "Retry";
 inline constexpr const char* kVoiceHint = "Long press BOOT to open or close";
+inline constexpr const char* kFiles = "Files";
+inline constexpr const char* kLoading = "Loading...";
+inline constexpr const char* kImageLoadFailed = "Failed to load image";
+inline constexpr const char* kUnsupportedFormat = "Unsupported format";
+inline constexpr const char* kShakeNext = "Shake to skip";
+inline constexpr const char* kFlipStop = "Flip to stop";
+inline constexpr const char* kSpeakReminders = "Speak reminders";
+inline constexpr const char* kVoiceDataMissing = "Voice data file missing";
 #endif
 
 }  // namespace metaos::text

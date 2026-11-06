@@ -19,6 +19,8 @@ class FileBrowser;
 // User settings shown on the settings page. They live in NVS ("metaos" namespace).
 struct MetaSettings {
     bool speak_reminders = true;
+    bool shake_next = false;
+    bool flip_stop = false;
 };
 
 // Touch UI on the LVGL top layer: a home screen with four tiles and one page each for music,
@@ -32,7 +34,7 @@ struct MetaSettings {
 // Without LVGL (OLED, e-paper, emote display) every method is a no-op.
 class MetaPanel {
 public:
-    enum class Page { kHome, kMusic, kReminders, kFiles, kSettings };
+    enum class Page { kHome, kMusic, kReminders, kFiles, kSettings, kImage, kText };
 
     struct Hooks {
         // Main task. Actions that belong to MetaOs.
@@ -98,9 +100,10 @@ private:
     void RefreshHome();
 
     // File viewer/editor sub-pages
-    // Read-only text viewer above the panel. Closed with the panel.
+    void ShowImageViewer(const std::string& path);
     void ShowTextViewer(const std::string& path);
     void CloseFileViewer();
+    void OnImageDecoded(void* decoded_image, const std::string& path);
 
     void OpenAlert(const char* icon, const std::string& title, const std::string& body,
                    int timeout_ms);
@@ -130,7 +133,11 @@ private:
 
     // File viewer state
     void* file_viewer_ = nullptr;
+    void* file_viewer_content_ = nullptr;  // Image or text content widget
     std::string viewing_file_;
+    void* loading_spinner_ = nullptr;
+    void* gif_player_ = nullptr;  // LvglGif* when viewing a GIF
+    void* image_dsc_ = nullptr;   // lv_img_dsc_t* for static images, needs manual cleanup
 
     void* alert_ = nullptr;
     void* alert_bar_ = nullptr;

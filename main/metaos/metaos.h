@@ -10,12 +10,14 @@
 #include "metaos_panel.h"
 
 class SdmmcCard;
+class Qmi8658;
 
 namespace metaos {
 
 class Storage;
 class ReminderStore;
 class MusicPlayer;
+class MotionDetector;
 struct Reminder;
 
 // MetaOS V2 on top of XiaoZhi. Adds SD card storage, reminders and local music playback,
@@ -27,7 +29,8 @@ struct Reminder;
 class MetaOs {
 public:
     // `card` may be null; storage-backed features then report that no card is present.
-    explicit MetaOs(SdmmcCard* card);
+    // `imu` may be null; motion gestures are then unavailable.
+    explicit MetaOs(SdmmcCard* card, Qmi8658* imu = nullptr);
     ~MetaOs();
 
     MetaOs(const MetaOs&) = delete;
@@ -49,6 +52,8 @@ private:
     std::unique_ptr<Storage> storage_;
     std::unique_ptr<ReminderStore> reminders_;
     std::unique_ptr<MusicPlayer> music_;
+    std::unique_ptr<MotionDetector> motion_;
+    Qmi8658* imu_;
     MetaSettings settings_;
     std::unique_ptr<MetaPanel> panel_;
     void* tick_timer_ = nullptr;

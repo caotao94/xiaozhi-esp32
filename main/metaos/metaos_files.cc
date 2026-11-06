@@ -40,18 +40,39 @@ bool FileBrowser::ListDirectory(const std::string& path, std::vector<FileEntry>&
             continue;
         }
 
-        std::string full_path = path + "/" + entry->d_name;
-        struct stat st;
-        if (stat(full_path.c_str(), &st) != 0) {
-            ESP_LOGW(TAG, "Failed to stat: %s", full_path.c_str());
-            continue;
-        }
-
         FileEntry file_entry;
         file_entry.name = entry->d_name;
-        file_entry.is_directory = S_ISDIR(st.st_mode);
-        file_entry.size = st.st_size;
-        file_entry.mtime = st.st_mtime;
+
+        // Use d_type when available (most FATFS implementations support it)
+        if (entry->d_type == DT_DIR) {
+            file_entry.is_directory = true;
+            file_entry.size = 0;
+            file_entry.mtime = 0;
+        } else if (entry->d_type == DT_REG) {
+            file_entry.is_directory = false;
+            // For files, still stat to get size and mtime (only when needed for display)
+            std::string full_path = path + "/" + entry->d_name;
+            struct stat st;
+            if (stat(full_path.c_str(), &st) == 0) {
+                file_entry.size = st.st_size;
+                file_entry.mtime = st.st_mtime;
+            } else {
+                file_entry.size = 0;
+                file_entry.mtime = 0;
+            }
+        } else {
+            // Fallback to stat if d_type is DT_UNKNOWN
+            std::string full_path = path + "/" + entry->d_name;
+            struct stat st;
+            if (stat(full_path.c_str(), &st) != 0) {
+                ESP_LOGW(TAG, "Failed to stat: %s", full_path.c_str());
+                continue;
+            }
+            file_entry.is_directory = S_ISDIR(st.st_mode);
+            file_entry.size = st.st_size;
+            file_entry.mtime = st.st_mtime;
+        }
+
         entries.push_back(file_entry);
     }
 

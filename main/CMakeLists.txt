@@ -70,12 +70,17 @@ endif()
 if(CONFIG_METAOS_ENABLE)
     list(APPEND SOURCES
         "boards/common/sd_card.cc"
+        "boards/common/qmi8658.cc"
         "metaos/metaos.cc"
         "metaos/metaos_common.cc"
         "metaos/metaos_files.cc"
+        "metaos/metaos_image.cc"
+        "metaos/metaos_motion.cc"
         "metaos/metaos_music.cc"
         "metaos/metaos_panel.cc"
         "metaos/metaos_reminders.cc"
+        "metaos/metaos_speech.cc"
+        "metaos/metaos_worker.cc"
     )
     list(APPEND INCLUDE_DIRS "metaos")
 endif()

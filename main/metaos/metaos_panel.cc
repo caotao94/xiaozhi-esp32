@@ -17,11 +17,14 @@
 
 #include "application.h"
 #include "board.h"
+#include "display/lvgl_display/gif/lvgl_gif.h"
 #include "lvgl_theme.h"
 #include "metaos_common.h"
 #include "metaos_files.h"
+#include "metaos_image.h"
 #include "metaos_music.h"
 #include "metaos_strings.h"
+#include "metaos_worker.h"
 #else
 #define METAOS_PANEL_ENABLED 0
 #endif
@@ -485,6 +488,10 @@ void MetaPanel::Open(Page page) {
         case Page::kSettings:
             BuildSettings();
             break;
+        case Page::kImage:
+        case Page::kText:
+            // These are handled by ShowImageViewer/ShowTextViewer, not BuildX methods
+            break;
     }
     if (scroll_y > 0 && list_area_ != nullptr) {
         lv_obj_update_layout(root);
@@ -528,9 +535,10 @@ void MetaPanel::RefreshLocked() {
             }
             break;
         case Page::kFiles:
-            // Files page doesn't need refresh
-            break;
+        case Page::kImage:
+        case Page::kText:
         case Page::kSettings:
+            // Static pages: nothing to refresh on a timer.
             break;
     }
 }
@@ -610,7 +618,7 @@ void MetaPanel::BuildHome() {
     const Tile tiles[4] = {
         {MATERIAL_SYMBOLS_MUSIC_NOTE, text::kMusic, Page::kMusic, 0x8E24AA},
         {MATERIAL_SYMBOLS_ALARM, text::kReminders, Page::kReminders, 0xF4511E},
-        {MATERIAL_SYMBOLS_SD_CARD, "文件", Page::kFiles, 0x43A047},
+        {MATERIAL_SYMBOLS_SD_CARD, text::kFiles, Page::kFiles, 0x43A047},
         {MATERIAL_SYMBOLS_SETTINGS, text::kSettings, Page::kSettings, 0x546E7A},
     };
 
@@ -796,7 +804,7 @@ void MetaPanel::BuildFiles() {
     auto crumbs = file_browser_->GetBreadcrumbs();
     std::string title;
     if (crumbs.size() <= 1) {
-        title = "文件";
+        title = text::kFiles;
     } else {
         title = crumbs.back();
     }
@@ -895,8 +903,7 @@ void MetaPanel::BuildFiles() {
                     Open(Page::kFiles);
                 }
             } else if (FileBrowser::IsImageFile(entry.name)) {
-                // No image decoding path yet (see README_metaos.md).
-                ShowToast("暂不支持查看图片");
+                ShowImageViewer(full_path);
             } else if (FileBrowser::IsTextFile(entry.name)) {
                 ShowTextViewer(full_path);
             } else {
@@ -944,6 +951,22 @@ void MetaPanel::BuildSettings() {
             Open(Page::kSettings);
         });
     }
+
+    // Motion gesture settings (if IMU is available)
+    // TODO: Check if IMU exists before showing these
+    AddSwitchRow(area, text::kShakeNext, settings_.shake_next, [this](bool enabled) {
+        settings_.shake_next = enabled;
+        if (hooks_.settings_changed) {
+            hooks_.settings_changed();
+        }
+    });
+    AddSwitchRow(area, text::kFlipStop, settings_.flip_stop, [this](bool enabled) {
+        settings_.flip_stop = enabled;
+        if (hooks_.settings_changed) {
+            hooks_.settings_changed();
+        }
+    });
+
     AddLabel(area, text::kVoiceHint, true);
 }
 
@@ -1127,6 +1150,212 @@ void MetaPanel::CloseToast() {
     }
 }
 
+void MetaPanel::ShowImageViewer(const std::string& path) {
+    LvglLock lock;
+    if (!lock) {
+        return;
+    }
+    theme_ = CurrentTheme();
+    if (theme_ == nullptr) {
+        return;
+    }
+
+    CloseFileViewer();
+    viewing_file_ = path;
+
+    // Full-screen viewer on the top layer
+    lv_obj_t* viewer = lv_obj_create(lv_layer_top());
+    file_viewer_ = viewer;
+    lv_obj_remove_style_all(viewer);
+    lv_obj_set_size(viewer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(viewer, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(viewer, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(viewer, 0, 0);
+    lv_obj_set_flex_flow(viewer, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(viewer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_text_font(viewer, theme_->text_font()->font(), 0);
+    lv_obj_set_style_text_color(viewer, lv_color_white(), 0);
+    lv_obj_add_flag(viewer, LV_OBJ_FLAG_CLICKABLE);
+
+    // Header bar with close button
+    lv_obj_t* header = Box(viewer);
+    lv_obj_set_size(header, LV_PCT(100), 40);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(header, 8, 0);
+
+    size_t last_slash = path.find_last_of('/');
+    std::string filename = (last_slash != std::string::npos) ? path.substr(last_slash + 1) : path;
+    lv_obj_t* name = lv_label_create(header);
+    lv_label_set_text(name, filename.c_str());
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_flex_grow(name, 1);
+
+    AddIconButton(header, MATERIAL_SYMBOLS_CLOSE, [this]() { CloseFileViewer(); });
+
+    // Content area (image will be placed here when decoded)
+    lv_obj_t* content = Box(viewer);
+    lv_obj_set_width(content, LV_PCT(100));
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    file_viewer_content_ = content;
+
+    // Show loading text
+    lv_obj_t* loading_label = lv_label_create(content);
+    lv_label_set_text(loading_label, text::kLoading);
+    lv_obj_set_style_text_color(loading_label, lv_color_white(), 0);
+    loading_spinner_ = loading_label;  // Track so we can delete it when the image arrives
+
+    // Start async decode on the worker
+    std::string path_copy = path;
+    bool posted = PostWork([this, path_copy]() {
+        ImageError error = ImageError::kNone;
+        auto decoded = DecodeImage(path_copy, 320, 240, error);
+
+        // Hand result back to main task
+        Application::GetInstance().Schedule(
+            [this, decoded_ptr = decoded.release(), path_copy, error]() {
+                std::unique_ptr<DecodedImage> decoded(decoded_ptr);
+
+                // Check if viewer is still open for this file
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+
+                LvglLock lock;
+                if (!lock) {
+                    return;
+                }
+
+                // Remove loading spinner
+                if (loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+
+                if (error != ImageError::kNone || decoded == nullptr) {
+                    // Show error message
+                    lv_obj_t* error_label = lv_label_create(Obj(file_viewer_content_));
+                    const char* msg = text::kImageLoadFailed;
+                    if (error == ImageError::kUnsupported) {
+                        msg = text::kUnsupportedFormat;
+                    }
+                    lv_label_set_text(error_label, msg);
+                    lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+                    return;
+                }
+
+                OnImageDecoded(decoded.release(), path_copy);
+            });
+    });
+
+    if (!posted) {
+        // Worker queue full
+        if (loading_spinner_ != nullptr) {
+            lv_obj_delete(Obj(loading_spinner_));
+            loading_spinner_ = nullptr;
+        }
+        lv_obj_t* error_label = lv_label_create(content);
+        lv_label_set_text(error_label, text::kImageLoadFailed);
+        lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+    }
+
+    // Keep alerts and toasts on top
+    if (alert_ != nullptr) {
+        lv_obj_move_foreground(Obj(alert_));
+    }
+    if (toast_ != nullptr) {
+        lv_obj_move_foreground(Obj(toast_));
+    }
+}
+
+void MetaPanel::OnImageDecoded(void* decoded_image, const std::string& path) {
+    auto* image = static_cast<DecodedImage*>(decoded_image);
+    if (image == nullptr || file_viewer_content_ == nullptr) {
+        delete image;
+        return;
+    }
+
+    if (image->kind == DecodedImage::Kind::kGif) {
+        // Check LVGL memory before creating GIF player (needs contiguous space)
+        lv_mem_monitor_t mon;
+        lv_mem_monitor(&mon);
+        size_t needed = image->width * image->height * 5 + 32768;  // GIF canvas + overhead
+        if (mon.free_biggest_size < needed) {
+            ESP_LOGW(TAG, "Not enough LVGL memory for GIF: need %zu, have %u", needed,
+                     mon.free_biggest_size);
+            lv_obj_t* error_label = lv_label_create(Obj(file_viewer_content_));
+            lv_label_set_text(error_label, "内存不足");
+            lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+            delete image;
+            return;
+        }
+
+        // Create LVGL image descriptor for GIF. Value-initialized: LVGL 9 checks
+        // header.magic and reads header.stride, so they must not be garbage.
+        lv_img_dsc_t* img_dsc = new (std::nothrow) lv_img_dsc_t();
+        if (img_dsc == nullptr) {
+            delete image;
+            return;
+        }
+        img_dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+        img_dsc->header.cf = LV_COLOR_FORMAT_RAW;
+        img_dsc->header.w = image->width;
+        img_dsc->header.h = image->height;
+        img_dsc->data = image->data;
+        img_dsc->data_size = image->size;
+
+        // Create GIF player
+        LvglGif* gif = new (std::nothrow) LvglGif(img_dsc);
+        if (gif == nullptr || !gif->IsLoaded()) {
+            delete gif;
+            delete img_dsc;
+            delete image;
+            lv_obj_t* error_label = lv_label_create(Obj(file_viewer_content_));
+            lv_label_set_text(error_label, text::kImageLoadFailed);
+            lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+            return;
+        }
+
+        lv_obj_t* img_obj = lv_image_create(Obj(file_viewer_content_));
+        lv_image_set_src(img_obj, gif->image_dsc());
+        gif->Start();
+        gif_player_ = gif;
+
+        // Transfer ownership - don't delete image data, GIF player needs it
+        image->data = nullptr;
+        delete image;
+        delete img_dsc;  // LvglGif makes its own copy
+    } else {
+        // Static bitmap (RGB565). Value-initialized; LVGL 9 needs magic and stride set.
+        lv_img_dsc_t* img_dsc = new (std::nothrow) lv_img_dsc_t();
+        if (img_dsc == nullptr) {
+            delete image;
+            return;
+        }
+        img_dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+        img_dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+        img_dsc->header.w = image->width;
+        img_dsc->header.h = image->height;
+        img_dsc->header.stride = image->width * 2;
+        img_dsc->data = image->data;
+        img_dsc->data_size = image->size;
+
+        lv_obj_t* img_obj = lv_image_create(Obj(file_viewer_content_));
+        lv_image_set_src(img_obj, img_dsc);
+
+        // Track for cleanup
+        image_dsc_ = img_dsc;
+
+        // Transfer ownership - LVGL will use the data, we'll free it in CloseFileViewer
+        image->data = nullptr;
+        delete image;
+    }
+}
+
 void MetaPanel::ShowTextViewer(const std::string& path) {
     LvglLock lock;
     if (!lock) {
@@ -1232,8 +1461,24 @@ void MetaPanel::CloseFileViewer() {
     }
     LvglLock lock;
     if (lock && file_viewer_ != nullptr) {
+        // Clean up GIF player if present
+        if (gif_player_ != nullptr) {
+            delete static_cast<LvglGif*>(gif_player_);
+            gif_player_ = nullptr;
+        }
+        // Clean up image descriptor and its data
+        if (image_dsc_ != nullptr) {
+            auto* img_dsc = static_cast<lv_img_dsc_t*>(image_dsc_);
+            if (img_dsc->data != nullptr) {
+                heap_caps_free(const_cast<uint8_t*>(img_dsc->data));
+            }
+            delete img_dsc;
+            image_dsc_ = nullptr;
+        }
         lv_obj_delete(Obj(file_viewer_));
         file_viewer_ = nullptr;
+        file_viewer_content_ = nullptr;
+        loading_spinner_ = nullptr;
         viewing_file_.clear();
     }
 }
