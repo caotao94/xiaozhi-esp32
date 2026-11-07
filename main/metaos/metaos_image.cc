@@ -474,6 +474,15 @@ DecodedImage::~DecodedImage() {
 
 std::unique_ptr<DecodedImage> DecodeImage(const std::string& path, int max_width, int max_height,
                                           ImageError& error) {
+    // Check available PSRAM before attempting decode
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t min_required = 2 * 1024 * 1024;  // Require at least 2 MB free
+    if (free_psram < min_required) {
+        ESP_LOGW(TAG, "Insufficient PSRAM: %zu bytes free (need %zu)", free_psram, min_required);
+        error = ImageError::kNoMemory;
+        return nullptr;
+    }
+
     FILE* f = fopen(path.c_str(), "rb");
     if (f == nullptr) {
         ESP_LOGE(TAG, "Failed to open: %s", path.c_str());
@@ -504,7 +513,8 @@ std::unique_ptr<DecodedImage> DecodeImage(const std::string& path, int max_width
     fseek(f, 0, SEEK_SET);
 
     Format format = DetectFormat(header, header_size);
-    ESP_LOGI(TAG, "Decoding %s: format=%d, size=%zu", path.c_str(), (int)format, file_size);
+    ESP_LOGI(TAG, "Decoding %s: format=%d, size=%zu, free_psram=%zu", path.c_str(), (int)format,
+             file_size, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     std::unique_ptr<DecodedImage> result;
     switch (format) {

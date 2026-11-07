@@ -9,6 +9,7 @@
 #define METAOS_PANEL_ENABLED 1
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_timer.h>
 #include <lvgl.h>
 #include <material_symbols.h>
 
@@ -1213,7 +1214,13 @@ void MetaPanel::ShowImageViewer(const std::string& path) {
     std::string path_copy = path;
     bool posted = PostWork([this, path_copy]() {
         ImageError error = ImageError::kNone;
+        int64_t start_time = esp_timer_get_time();
         auto decoded = DecodeImage(path_copy, 320, 240, error);
+        int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
+
+        if (elapsed_ms > 10000) {
+            ESP_LOGW("MetaPanel", "Image decode took %lld ms: %s", elapsed_ms, path_copy.c_str());
+        }
 
         // Hand result back to main task
         Application::GetInstance().Schedule(
@@ -1242,9 +1249,17 @@ void MetaPanel::ShowImageViewer(const std::string& path) {
                     const char* msg = text::kImageLoadFailed;
                     if (error == ImageError::kUnsupported) {
                         msg = text::kUnsupportedFormat;
+                    } else if (error == ImageError::kNoMemory) {
+                        msg = "内存不足";
+                    } else if (error == ImageError::kTooLarge) {
+                        msg = "文件过大";
+                    } else if (error == ImageError::kCorrupt) {
+                        msg = "文件损坏";
                     }
                     lv_label_set_text(error_label, msg);
                     lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+                    ESP_LOGE("MetaPanel", "Image decode failed: %s, error=%d", path_copy.c_str(),
+                             (int)error);
                     return;
                 }
 
@@ -1369,36 +1384,7 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     CloseFileViewer();
     viewing_file_ = path;
 
-    // Read file content
-    FILE* f = fopen(path.c_str(), "r");
-    if (!f) {
-        ShowToast("无法打开文件");
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    // Limit to 64KB for memory safety
-    if (size > 65536) {
-        fclose(f);
-        ShowToast("文件太大");
-        return;
-    }
-
-    std::string content;
-    content.resize(size);
-    size_t read = fread(&content[0], 1, size, f);
-    fclose(f);
-
-    if (read != static_cast<size_t>(size)) {
-        ShowToast("读取失败");
-        return;
-    }
-
-    // Full-screen viewer on the top layer, above the panel (the panel root lives there too, so
-    // the viewer must be created after it to be drawn on top).
+    // Create viewer UI with loading indicator first
     lv_obj_t* viewer = lv_obj_create(lv_layer_top());
     file_viewer_ = viewer;
     lv_obj_remove_style_all(viewer);
@@ -1409,14 +1395,11 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     lv_obj_set_style_pad_row(viewer, 6, 0);
     lv_obj_set_flex_flow(viewer, LV_FLEX_FLOW_COLUMN);
     lv_obj_remove_flag(viewer, LV_OBJ_FLAG_SCROLLABLE);
-    // Not a child of root_, so the theme font and color must be set here; the default font has
-    // no Chinese glyphs.
     lv_obj_set_style_text_font(viewer, theme_->text_font()->font(), 0);
     lv_obj_set_style_text_color(viewer, theme_->text_color(), 0);
-    // Taps must not fall through to the panel underneath.
     lv_obj_add_flag(viewer, LV_OBJ_FLAG_CLICKABLE);
 
-    // Header: file name, then a close button that stays visible however long the name is.
+    // Header
     lv_obj_t* header = Box(viewer);
     lv_obj_set_size(header, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
@@ -1431,7 +1414,7 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     lv_obj_set_flex_grow(name, 1);
     AddIconButton(header, MATERIAL_SYMBOLS_CLOSE, [this]() { CloseFileViewer(); });
 
-    // Read-only text: a plain label in a scrollable box, no text area or keyboard.
+    // Content area with loading message
     lv_obj_t* scroll_area = Box(viewer);
     lv_obj_add_flag(scroll_area,
                     static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
@@ -1439,18 +1422,156 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     lv_obj_set_flex_grow(scroll_area, 1);
     lv_obj_set_scroll_dir(scroll_area, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(scroll_area, LV_SCROLLBAR_MODE_ACTIVE);
+    file_viewer_content_ = scroll_area;
 
-    lv_obj_t* text_label = lv_label_create(scroll_area);
-    lv_obj_set_width(text_label, LV_PCT(100));
-    lv_label_set_long_mode(text_label, LV_LABEL_LONG_MODE_WRAP);
-    lv_label_set_text(text_label, content.empty() ? "(空文件)" : content.c_str());
+    lv_obj_t* loading_label = lv_label_create(scroll_area);
+    lv_label_set_text(loading_label, "加载中...");
+    lv_obj_set_style_text_color(loading_label, SecondaryText(theme_), 0);
+    loading_spinner_ = loading_label;
 
-    // Alerts and toasts stay above the viewer.
+    // Alerts and toasts stay above the viewer
     if (alert_ != nullptr) {
         lv_obj_move_foreground(Obj(alert_));
     }
     if (toast_ != nullptr) {
         lv_obj_move_foreground(Obj(toast_));
+    }
+
+    // Load file asynchronously
+    std::string path_copy = path;
+    bool posted = PostWork([this, path_copy]() {
+        int64_t start_time = esp_timer_get_time();
+
+        FILE* f = fopen(path_copy.c_str(), "r");
+        if (!f) {
+            Application::GetInstance().Schedule([this, path_copy]() {
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+                LvglLock lock;
+                if (lock && loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+                ShowToast("无法打开文件");
+                CloseFileViewer();
+            });
+            return;
+        }
+
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        // Increased limit to 512KB with memory check
+        constexpr long kMaxSize = 512 * 1024;
+        size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+        if (size > kMaxSize || size < 0) {
+            fclose(f);
+            Application::GetInstance().Schedule([this, path_copy, size]() {
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+                LvglLock lock;
+                if (lock && loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+                char msg[64];
+                snprintf(msg, sizeof(msg), "文件太大 (%.1f KB)", size / 1024.0);
+                ShowToast(msg);
+                CloseFileViewer();
+            });
+            return;
+        }
+
+        // Check if we have enough memory (need 2x file size for safety)
+        if (free_psram < (size_t)size * 2 + 1024 * 1024) {
+            fclose(f);
+            ESP_LOGW("MetaPanel", "Insufficient PSRAM for text file: %ld bytes, free: %zu", size,
+                     free_psram);
+            Application::GetInstance().Schedule([this, path_copy]() {
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+                LvglLock lock;
+                if (lock && loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+                ShowToast("内存不足");
+                CloseFileViewer();
+            });
+            return;
+        }
+
+        std::string content;
+        content.resize(size);
+        size_t read = fread(&content[0], 1, size, f);
+        fclose(f);
+
+        int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
+        ESP_LOGI("MetaPanel", "Text file loaded: %s, %ld bytes, %lld ms", path_copy.c_str(), size,
+                 elapsed_ms);
+
+        if (read != static_cast<size_t>(size)) {
+            Application::GetInstance().Schedule([this, path_copy]() {
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+                LvglLock lock;
+                if (lock && loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+                ShowToast("读取失败");
+                CloseFileViewer();
+            });
+            return;
+        }
+
+        // Show content on main task
+        Application::GetInstance().Schedule(
+            [this, path_copy, content = std::move(content), elapsed_ms]() {
+                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
+                    return;
+                }
+
+                LvglLock lock;
+                if (!lock) {
+                    return;
+                }
+
+                // Remove loading spinner
+                if (loading_spinner_ != nullptr) {
+                    lv_obj_delete(Obj(loading_spinner_));
+                    loading_spinner_ = nullptr;
+                }
+
+                if (file_viewer_content_ == nullptr) {
+                    return;
+                }
+
+                // Create text label
+                lv_obj_t* text_label = lv_label_create(Obj(file_viewer_content_));
+                lv_obj_set_width(text_label, LV_PCT(100));
+                lv_label_set_long_mode(text_label, LV_LABEL_LONG_MODE_WRAP);
+                lv_label_set_text(text_label, content.empty() ? "(空文件)" : content.c_str());
+
+                if (elapsed_ms > 1000) {
+                    ESP_LOGW("MetaPanel", "Text rendering took %lld ms", elapsed_ms);
+                }
+            });
+    });
+
+    if (!posted) {
+        if (loading_spinner_ != nullptr) {
+            lv_obj_delete(Obj(loading_spinner_));
+            loading_spinner_ = nullptr;
+        }
+        ShowToast("任务队列已满");
+        CloseFileViewer();
     }
 }
 

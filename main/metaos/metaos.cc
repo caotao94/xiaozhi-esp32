@@ -16,6 +16,7 @@
 #include "metaos_motion.h"
 #include "metaos_music.h"
 #include "metaos_reminders.h"
+#include "metaos_speech.h"
 #include "metaos_strings.h"
 #include "qmi8658.h"
 #include "sd_card.h"
@@ -51,6 +52,7 @@ MetaOs::MetaOs(SdmmcCard* card, Qmi8658* imu)
     : storage_(std::make_unique<Storage>(card)), imu_(imu) {
     reminders_ = std::make_unique<ReminderStore>(*storage_);
     music_ = std::make_unique<MusicPlayer>(*storage_);
+    speech_ = std::make_unique<SpeechSynthesizer>(*storage_);
     panel_ = std::make_unique<MetaPanel>(
         *storage_, *music_, *reminders_, settings_,
         MetaPanel::Hooks{
@@ -223,6 +225,14 @@ void MetaOs::FireReminders() {
     }
     // Spoken reminders need on-device TTS: the XiaoZhi protocol has no way to make the server
     // say a given text (the wake-word "detect" message rejects long text).
+    if (settings_.speak_reminders && speech_->IsVoiceDataAvailable()) {
+        std::vector<std::string> messages;
+        messages.reserve(due.size());
+        for (const auto& reminder : due) {
+            messages.push_back(reminder.message);
+        }
+        speech_->SynthesizeAndPlay(messages);
+    }
     PlayAlertSound(Lang::Sounds::OGG_VIBRATION);
 }
 

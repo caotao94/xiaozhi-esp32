@@ -18,6 +18,7 @@ class Storage;
 class ReminderStore;
 class MusicPlayer;
 class MotionDetector;
+class SpeechSynthesizer;
 struct Reminder;
 
 // MetaOS V2 on top of XiaoZhi. Adds SD card storage, reminders and local music playback,
@@ -53,6 +54,7 @@ private:
     std::unique_ptr<ReminderStore> reminders_;
     std::unique_ptr<MusicPlayer> music_;
     std::unique_ptr<MotionDetector> motion_;
+    std::unique_ptr<SpeechSynthesizer> speech_;
     Qmi8658* imu_;
     MetaSettings settings_;
     std::unique_ptr<MetaPanel> panel_;
