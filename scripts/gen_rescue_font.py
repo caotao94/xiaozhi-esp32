@@ -9,6 +9,7 @@ Requires: fontTools (system python), node/npx (for lv_font_conv@1.5.3), and a
 Noto Sans SC source font (OFL). Run with the system python that has fontTools:
     python scripts/gen_rescue_font.py
 """
+import json
 import re
 import shutil
 import subprocess
@@ -21,6 +22,9 @@ UI = ROOT / "main" / "rescue" / "rescue_ui.cc"
 OUT = ROOT / "main" / "rescue" / "rescue_font.c"
 FONT_NAME = "font_rescue_20_4"
 LV_FONT_CONV_VERSION = "1.5.3"
+# 主程序通用汉字集（6845 码点）。救援仓库的固件名来自 manifest（运行时动态内容），
+# 仅靠 UI 固定文案提取的子集会缺字，故并入这套通用字符集保证任意常见固件名可渲染。
+COMMON_CHARSET = ROOT / "managed_components" / "78__xiaozhi-fonts" / "charsets" / "common.json"
 
 # Candidate Noto Sans SC sources (OFL licensed). Variable font preferred.
 FONT_CANDIDATES = [
@@ -38,6 +42,12 @@ def extract_codepoints() -> set:
         for ch in lit:
             if ord(ch) > 0x7E:
                 cps.add(ord(ch))
+    # 并入通用汉字集，覆盖运行时固件名等动态内容（仅 UI 文案子集会缺字）。
+    if COMMON_CHARSET.exists():
+        data = json.loads(COMMON_CHARSET.read_text(encoding="utf-8"))
+        cps.update(c for c in data.get("codepoints", []) if c > 0x7E)
+    else:
+        print(f"WARNING: common charset not found: {COMMON_CHARSET}")
     return cps
 
 

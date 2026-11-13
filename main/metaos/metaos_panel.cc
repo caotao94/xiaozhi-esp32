@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
+#include <memory>
 
 #include "application.h"
 #include "board.h"
@@ -55,6 +57,10 @@ constexpr int kReminderAlertMs = 3 * 60 * 1000;
 // Firmware confirmations time out to "cancel" if the user walks away.
 constexpr int kFwDialogMs = 30 * 1000;
 constexpr size_t kTracksPerPage = 30;
+// 文本分页：每页目标字节数（页尾对齐到换行/UTF-8 边界，实际长度可变）。
+constexpr size_t kTextPageSize = 6 * 1024;
+// 文件总大小的宽松上限，只防极端文件；分页读取本身内存恒定。
+constexpr long kTextMaxSize = 16 * 1024 * 1024;
 
 class LvglLock {
 public:
@@ -199,6 +205,83 @@ void DisableButton(void* button, LvglTheme* theme) {
     lv_obj_add_state(obj, LV_STATE_DISABLED);
     lv_obj_set_style_bg_color(obj, SecondaryText(theme), LV_STATE_DISABLED);
     lv_obj_set_style_text_opa(obj, LV_OPA_50, LV_STATE_DISABLED);
+}
+
+// 文本分页读取结果。error 为 kNone 时 content/next_offset/size 有效。
+enum class TextPageError { kNone, kOpen, kRead, kTooLarge };
+
+struct TextPage {
+    std::string content;
+    long next_offset = 0;  // 下一页起始偏移
+    long size = 0;         // 文件总大小
+    TextPageError error = TextPageError::kNone;
+};
+
+// 工作线程执行：打开文件、从 offset 读取一页、立即关闭，不跨任务持有 FILE*。
+// 页尾优先对齐到块内最后一个换行符；没有换行（超长单行）时按 UTF-8 字符边界硬切。
+TextPage ReadTextPage(const std::string& path, long offset) {
+    TextPage page;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        page.error = TextPageError::kOpen;
+        return page;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        page.error = TextPageError::kRead;
+        return page;
+    }
+    page.size = size;
+    if (size > kTextMaxSize) {
+        fclose(f);
+        page.error = TextPageError::kTooLarge;
+        return page;
+    }
+    if (offset >= size) {
+        // 空文件（或文件已变小）：返回空的末页。
+        fclose(f);
+        page.next_offset = size;
+        return page;
+    }
+    if (fseek(f, offset, SEEK_SET) != 0) {
+        fclose(f);
+        page.error = TextPageError::kRead;
+        return page;
+    }
+    // 多读 4 个字节，用于检查切点处的字符是否完整（UTF-8 字符最长 4 字节）。
+    std::string buf(kTextPageSize + 4, '\0');
+    size_t n = fread(&buf[0], 1, buf.size(), f);
+    fclose(f);
+    if (n == 0) {
+        page.error = TextPageError::kRead;
+        return page;
+    }
+    size_t end = n;
+    if (n == buf.size() && offset + static_cast<long>(n) < size) {
+        // 后面还有内容：尽量让页尾落在完整的一行之后。
+        size_t newline = buf.rfind('\n', kTextPageSize - 1);
+        // 仅当换行对齐不会把页缩得过小（<半页）时才采用，避免稀疏换行文件产生
+        // 极小页（如唯一换行在位置 0 时只含 1 字节）。否则按 UTF-8 边界硬切。
+        if (newline != std::string::npos && newline + 1 >= kTextPageSize / 2) {
+            // '\n' 是 ASCII，不会出现在多字节字符中间，行尾切分天然安全。
+            end = newline + 1;
+        } else {
+            // 超长单行/稀疏换行：硬切。若切点落在多字节字符中间（buf[end] 是后续字节），
+            // 回退到字符起始处；最多回退 3 字节，保证非法 UTF-8 数据也能前进。
+            end = kTextPageSize;
+            int backoff = 0;
+            while (end > 0 && backoff < 3 &&
+                   (static_cast<unsigned char>(buf[end]) & 0xC0) == 0x80) {
+                --end;
+                ++backoff;
+            }
+        }
+    }
+    page.content = buf.substr(0, end);
+    page.next_offset = offset + static_cast<long>(end);
+    return page;
 }
 
 void DispatchTap(lv_event_t* event) {
@@ -513,6 +596,11 @@ void MetaPanel::ClearPageRefs() {
     fw_cancel_button_ = nullptr;
     // fw_selected_index_ is not a widget pointer: it survives page rebuilds and is
     // reset when the repository content changes.
+    // 文本分页控件随查看器一起销毁，这里只清引用；数值状态在 CloseFileViewer 里复位。
+    text_label_ = nullptr;
+    text_prev_button_ = nullptr;
+    text_next_button_ = nullptr;
+    text_position_label_ = nullptr;
 }
 
 void MetaPanel::Open(Page page) {
@@ -1602,6 +1690,7 @@ void MetaPanel::ShowImageViewer(const std::string& path) {
     // Full-screen viewer on the top layer
     lv_obj_t* viewer = lv_obj_create(lv_layer_top());
     file_viewer_ = viewer;
+    building_buttons_ = &viewer_buttons_;  // 查看器按钮单独存放，关闭时立即释放
     lv_obj_remove_style_all(viewer);
     lv_obj_set_size(viewer, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(viewer, lv_color_black(), 0);
@@ -1629,6 +1718,7 @@ void MetaPanel::ShowImageViewer(const std::string& path) {
     lv_obj_set_flex_grow(name, 1);
 
     AddIconButton(header, MATERIAL_SYMBOLS_CLOSE, [this]() { CloseFileViewer(); });
+    building_buttons_ = &page_buttons_;
 
     // Content area (image will be placed here when decoded)
     lv_obj_t* content = Box(viewer);
@@ -1819,9 +1909,18 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     CloseFileViewer();
     viewing_file_ = path;
 
+    // 复位分页状态；会话号递增，用于丢弃上一次打开遗留的翻页结果。
+    text_offset_ = 0;
+    text_next_offset_ = 0;
+    text_size_ = 0;
+    text_history_.clear();
+    text_loading_ = false;
+    ++text_session_;
+
     // Create viewer UI with loading indicator first
     lv_obj_t* viewer = lv_obj_create(lv_layer_top());
     file_viewer_ = viewer;
+    building_buttons_ = &viewer_buttons_;  // 查看器按钮单独存放，关闭时立即释放
     lv_obj_remove_style_all(viewer);
     lv_obj_set_size(viewer, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(viewer, theme_->background_color(), 0);
@@ -1864,6 +1963,37 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
     lv_obj_set_style_text_color(loading_label, SecondaryText(theme_), 0);
     loading_spinner_ = loading_label;
 
+    // 底部导航栏：上一页 / 位置指示 / 下一页。首页禁用上一页，末页禁用下一页。
+    lv_obj_t* bar = Box(viewer);
+    lv_obj_set_size(bar, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    text_prev_button_ = AddTextButton(bar, text::kPrevPage, [this]() {
+        if (text_loading_ || text_history_.empty()) {
+            return;
+        }
+        long offset = text_history_.back();
+        if (LoadTextPage(offset)) {
+            text_history_.pop_back();
+        }
+    });
+    text_position_label_ = AddLabel(bar, "...", true);
+    // 让位置指示占据剩余宽度并可省略，避免大字体下把"下一页"按钮挤出右缘。
+    lv_obj_set_flex_grow(Obj(text_position_label_), 1);
+    lv_label_set_long_mode(Obj(text_position_label_), LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(Obj(text_position_label_), LV_TEXT_ALIGN_CENTER, 0);
+    text_next_button_ = AddTextButton(bar, text::kNextPage, [this]() {
+        if (text_loading_ || text_label_ == nullptr || text_next_offset_ >= text_size_) {
+            return;
+        }
+        if (LoadTextPage(text_next_offset_)) {
+            text_history_.push_back(text_offset_);
+        }
+    });
+    DisableButton(text_prev_button_, theme_);
+    DisableButton(text_next_button_, theme_);
+
     // Alerts and toasts stay above the viewer
     if (alert_ != nullptr) {
         lv_obj_move_foreground(Obj(alert_));
@@ -1872,141 +2002,127 @@ void MetaPanel::ShowTextViewer(const std::string& path) {
         lv_obj_move_foreground(Obj(toast_));
     }
 
-    // Load file asynchronously
-    std::string path_copy = path;
-    bool posted = PostWork([this, path_copy]() {
-        int64_t start_time = esp_timer_get_time();
+    building_buttons_ = &page_buttons_;
+    // 异步读取第一页；队列满/读取失败的提示与关闭逻辑在 LoadTextPage 内。
+    LoadTextPage(0);
+}
 
-        FILE* f = fopen(path_copy.c_str(), "r");
-        if (!f) {
-            Application::GetInstance().Schedule([this, path_copy]() {
-                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
-                    return;
+// 主任务。持（递归）LVGL 锁：翻页按钮回调不带锁调用这里。
+// 在工作线程读取 offset 处的一页，完成后回主任务更新界面。队列满时返回 false。
+bool MetaPanel::LoadTextPage(long offset) {
+    LvglLock lock;
+    if (!lock || text_loading_) {
+        return false;
+    }
+    std::string path = viewing_file_;
+    unsigned session = text_session_;
+    text_loading_ = true;
+    UpdateTextPager();  // 读取期间禁用两个翻页按钮
+    bool posted = PostWork([this, path, offset, session]() mutable {
+        auto page = std::make_shared<TextPage>(ReadTextPage(path, offset));
+        // apply 自引用以支持取锁失败重试；每个终止路径异步 reset 断开引用环，
+        // 避免在执行中销毁自身，也避免泄漏。
+        auto apply = std::make_shared<std::function<void()>>();
+        *apply = [this, path, offset, session, page, apply]() {
+            // 查看器已关闭、换了文件或重新打开过：丢弃过期结果。
+            if (file_viewer_ == nullptr || viewing_file_ != path || session != text_session_) {
+                Application::GetInstance().Schedule([apply]() { (*apply) = nullptr; });
+                return;
+            }
+            // 先取锁再复位 text_loading_：取锁失败时保持 loading 并重试，
+            // 否则按钮会停留在禁用态且无人重新启用，翻页永久卡死。
+            LvglLock lock;
+            if (!lock) {
+                Application::GetInstance().Schedule([apply]() { (*apply)(); });
+                return;
+            }
+            text_loading_ = false;
+            if (page->error != TextPageError::kNone) {
+                if (page->error == TextPageError::kTooLarge) {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "文件太大 (%.1f MB)", page->size / 1048576.0);
+                    ShowToast(msg);
+                } else if (page->error == TextPageError::kOpen) {
+                    ShowToast("无法打开文件");
+                } else {
+                    ShowToast("读取失败");
                 }
-                LvglLock lock;
-                if (lock && loading_spinner_ != nullptr) {
-                    lv_obj_delete(Obj(loading_spinner_));
-                    loading_spinner_ = nullptr;
-                }
-                ShowToast("无法打开文件");
                 CloseFileViewer();
-            });
-            return;
-        }
-
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-
-        // Increased limit to 512KB with memory check
-        constexpr long kMaxSize = 512 * 1024;
-        size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-
-        if (size > kMaxSize || size < 0) {
-            fclose(f);
-            Application::GetInstance().Schedule([this, path_copy, size]() {
-                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
-                    return;
-                }
-                LvglLock lock;
-                if (lock && loading_spinner_ != nullptr) {
-                    lv_obj_delete(Obj(loading_spinner_));
-                    loading_spinner_ = nullptr;
-                }
-                char msg[64];
-                snprintf(msg, sizeof(msg), "文件太大 (%.1f KB)", size / 1024.0);
-                ShowToast(msg);
-                CloseFileViewer();
-            });
-            return;
-        }
-
-        // Check if we have enough memory (need 2x file size for safety)
-        if (free_psram < (size_t)size * 2 + 1024 * 1024) {
-            fclose(f);
-            ESP_LOGW("MetaPanel", "Insufficient PSRAM for text file: %ld bytes, free: %zu", size,
-                     free_psram);
-            Application::GetInstance().Schedule([this, path_copy]() {
-                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
-                    return;
-                }
-                LvglLock lock;
-                if (lock && loading_spinner_ != nullptr) {
-                    lv_obj_delete(Obj(loading_spinner_));
-                    loading_spinner_ = nullptr;
-                }
-                ShowToast("内存不足");
-                CloseFileViewer();
-            });
-            return;
-        }
-
-        std::string content;
-        content.resize(size);
-        size_t read = fread(&content[0], 1, size, f);
-        fclose(f);
-
-        int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
-        ESP_LOGI("MetaPanel", "Text file loaded: %s, %ld bytes, %lld ms", path_copy.c_str(), size,
-                 elapsed_ms);
-
-        if (read != static_cast<size_t>(size)) {
-            Application::GetInstance().Schedule([this, path_copy]() {
-                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
-                    return;
-                }
-                LvglLock lock;
-                if (lock && loading_spinner_ != nullptr) {
-                    lv_obj_delete(Obj(loading_spinner_));
-                    loading_spinner_ = nullptr;
-                }
-                ShowToast("读取失败");
-                CloseFileViewer();
-            });
-            return;
-        }
-
-        // Show content on main task
-        Application::GetInstance().Schedule(
-            [this, path_copy, content = std::move(content), elapsed_ms]() {
-                if (file_viewer_ == nullptr || viewing_file_ != path_copy) {
-                    return;
-                }
-
-                LvglLock lock;
-                if (!lock) {
-                    return;
-                }
-
-                // Remove loading spinner
-                if (loading_spinner_ != nullptr) {
-                    lv_obj_delete(Obj(loading_spinner_));
-                    loading_spinner_ = nullptr;
-                }
-
-                if (file_viewer_content_ == nullptr) {
-                    return;
-                }
-
-                // Create text label
-                lv_obj_t* text_label = lv_label_create(Obj(file_viewer_content_));
-                lv_obj_set_width(text_label, LV_PCT(100));
-                lv_label_set_long_mode(text_label, LV_LABEL_LONG_MODE_WRAP);
-                lv_label_set_text(text_label, content.empty() ? "(空文件)" : content.c_str());
-
-                if (elapsed_ms > 1000) {
-                    ESP_LOGW("MetaPanel", "Text rendering took %lld ms", elapsed_ms);
-                }
-            });
+                Application::GetInstance().Schedule([apply]() { (*apply) = nullptr; });
+                return;
+            }
+            if (loading_spinner_ != nullptr) {
+                lv_obj_delete(Obj(loading_spinner_));
+                loading_spinner_ = nullptr;
+            }
+            if (file_viewer_content_ == nullptr) {
+                Application::GetInstance().Schedule([apply]() { (*apply) = nullptr; });
+                return;
+            }
+            if (text_label_ == nullptr) {
+                lv_obj_t* label = lv_label_create(Obj(file_viewer_content_));
+                lv_obj_set_width(label, LV_PCT(100));
+                lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
+                text_label_ = label;
+            }
+            lv_label_set_text(Obj(text_label_),
+                              page->content.empty() ? "(空文件)" : page->content.c_str());
+            // 每页从滚动区顶部开始显示。
+            lv_obj_scroll_to_y(Obj(file_viewer_content_), 0, LV_ANIM_OFF);
+            text_offset_ = offset;
+            text_next_offset_ = page->next_offset;
+            text_size_ = page->size;
+            if (offset == 0) {
+                ESP_LOGI(TAG, "Text file opened: %s, %ld bytes", path.c_str(), page->size);
+            }
+            UpdateTextPager();
+            Application::GetInstance().Schedule([apply]() { (*apply) = nullptr; });
+        };
+        Application::GetInstance().Schedule([apply]() { (*apply)(); });
     });
-
     if (!posted) {
-        if (loading_spinner_ != nullptr) {
-            lv_obj_delete(Obj(loading_spinner_));
-            loading_spinner_ = nullptr;
-        }
+        text_loading_ = false;
+        UpdateTextPager();
         ShowToast("任务队列已满");
-        CloseFileViewer();
+        if (text_label_ == nullptr) {
+            // 第一页就发不出去：没有内容可显示，直接关闭。
+            CloseFileViewer();
+        }
+    }
+    return posted;
+}
+
+// 主任务，需持 LVGL 锁。刷新位置指示与上一页/下一页按钮的可用状态。
+void MetaPanel::UpdateTextPager() {
+    if (text_position_label_ == nullptr) {
+        return;
+    }
+    if (text_label_ != nullptr) {
+        char position[48];
+        if (text_size_ < 1024 * 1024) {
+            snprintf(position, sizeof(position), "%.1f / %.1f KB", text_offset_ / 1024.0,
+                     text_size_ / 1024.0);
+        } else {
+            snprintf(position, sizeof(position), "%.1f / %.1f MB", text_offset_ / 1048576.0,
+                     text_size_ / 1048576.0);
+        }
+        SetLabel(text_position_label_, position);
+    }
+    bool prev_enabled = !text_loading_ && !text_history_.empty();
+    bool next_enabled = !text_loading_ && text_label_ != nullptr && text_next_offset_ < text_size_;
+    if (text_prev_button_ != nullptr) {
+        if (prev_enabled) {
+            lv_obj_remove_state(Obj(text_prev_button_), LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(Obj(text_prev_button_), LV_STATE_DISABLED);
+        }
+    }
+    if (text_next_button_ != nullptr) {
+        if (next_enabled) {
+            lv_obj_remove_state(Obj(text_next_button_), LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(Obj(text_next_button_), LV_STATE_DISABLED);
+        }
     }
 }
 
@@ -2032,10 +2148,22 @@ void MetaPanel::CloseFileViewer() {
             image_dsc_ = nullptr;
         }
         lv_obj_delete(Obj(file_viewer_));
+        FreeButtons(viewer_buttons_);  // 立即释放查看器按钮，避免文件页内反复开合累积
         file_viewer_ = nullptr;
         file_viewer_content_ = nullptr;
         loading_spinner_ = nullptr;
         viewing_file_.clear();
+        // 文本分页：控件已随查看器销毁，复位状态并释放翻页历史占用的内存。
+        text_label_ = nullptr;
+        text_prev_button_ = nullptr;
+        text_next_button_ = nullptr;
+        text_position_label_ = nullptr;
+        text_offset_ = 0;
+        text_next_offset_ = 0;
+        text_size_ = 0;
+        text_history_.clear();
+        text_history_.shrink_to_fit();
+        text_loading_ = false;
     }
 }
 

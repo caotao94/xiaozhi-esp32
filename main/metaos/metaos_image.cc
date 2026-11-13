@@ -119,6 +119,34 @@ bool ReadPngChunk(FILE* f, PngChunk& chunk) {
     return true;
 }
 
+// 持有一块 heap_caps 分配的内存，离开作用域自动释放。异常被禁用，DecodePng 的
+// 流式解码有多条错误返回路径，用 RAII 保证 compressed/环形缓冲/行缓冲/输出位图
+// 在任何路径上都不泄漏。heap_caps_free(nullptr) 是安全的空操作。
+class PngScratch {
+public:
+    PngScratch() = default;
+    ~PngScratch() { heap_caps_free(ptr_); }
+    PngScratch(const PngScratch&) = delete;
+    PngScratch& operator=(const PngScratch&) = delete;
+
+    uint8_t* Alloc(size_t size, uint32_t caps) {
+        ptr_ = static_cast<uint8_t*>(heap_caps_malloc(size, caps));
+        return ptr_;
+    }
+    // 接管一块已分配的内存（如 IDAT 收集阶段分配的 compressed）。
+    void Adopt(uint8_t* p) { ptr_ = p; }
+    uint8_t* get() const { return ptr_; }
+    // 交出所有权（成功时把输出位图转交给 DecodedImage）。
+    uint8_t* Release() {
+        uint8_t* p = ptr_;
+        ptr_ = nullptr;
+        return p;
+    }
+
+private:
+    uint8_t* ptr_ = nullptr;
+};
+
 std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, ImageError& error) {
     // Read PNG header
     uint8_t sig[8];
@@ -166,7 +194,9 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
         return nullptr;
     }
 
-    if (width > 4096 || height > 4096) {
+    // 流式解码后内存不再随宽*高增长，尺寸上限放宽到 8192。
+    // 行缓冲 stride 最大 8192*8+1≈64KB，仍可接受；IDAT 压缩上限保持 8MB。
+    if (width > 8192 || height > 8192) {
         ESP_LOGW(TAG, "PNG too large: %lux%lu", width, height);
         error = ImageError::kTooLarge;
         return nullptr;
@@ -185,8 +215,8 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
     // PSRAM allocation. The previous std::vector grew via operator new, which
     // abort()s on allocation failure because C++ exceptions are disabled; a
     // 1024x1024 PNG crashed the device this way. heap_caps_malloc lets us
-    // return kNoMemory instead. The 8MB cap rejects huge PNGs whose raw data
-    // could never fit the 8MB PSRAM anyway; they fail fast with kTooLarge.
+    // return kNoMemory instead. The 8MB cap bounds the compressed IDAT buffer
+    // held in PSRAM during streaming decode; larger inputs fail fast with kTooLarge.
     constexpr size_t kMaxCompressedBytes = 8 * 1024 * 1024;
     long idat_start = ftell(f);
     if (idat_start < 0) {
@@ -269,7 +299,7 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
     }
 
     // Decompress with the ROM tinfl. Grayscale+alpha(4) is 2 bytes/pixel; getting
-    // this wrong halves raw_size and makes the inflate loop stall.
+    // this wrong halves the stride and misaligns every scanline.
     size_t bytes_per_pixel = (color_type == 2)   ? 3
                              : (color_type == 6) ? 4
                              : (color_type == 4) ? 2
@@ -278,163 +308,198 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
         bytes_per_pixel *= 2;
     }
     size_t stride = width * bytes_per_pixel + 1;  // +1 for filter byte
-    size_t raw_size = stride * height;
+    // 流式解码：不再分配整幅 raw 缓冲（stride*height 可能远超 8MB PSRAM）。
+    // 改为 tinfl 环形缓冲 + 两个行缓冲，边 inflate 边 unfilter 边缩放。
+    // compressed 交给 RAII 接管，之后任何返回路径都会自动释放它。
+    PngScratch compressed_guard;
+    compressed_guard.Adopt(compressed);
 
-    uint8_t* raw = static_cast<uint8_t*>(heap_caps_malloc(raw_size, MALLOC_CAP_SPIRAM));
-    if (raw == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %zu bytes for PNG raw", raw_size);
-        heap_caps_free(compressed);
-        error = ImageError::kNoMemory;
-        return nullptr;
-    }
-
-    // Inflate
-    tinfl_decompressor inflator;
-    tinfl_init(&inflator);
-    size_t in_pos = 0, out_pos = 0;
-    int status = TINFL_STATUS_NEEDS_MORE_INPUT;
-
-    while (status == TINFL_STATUS_NEEDS_MORE_INPUT || status == TINFL_STATUS_HAS_MORE_OUTPUT) {
-        size_t in_avail = compressed_size - in_pos;
-        size_t out_avail = raw_size - out_pos;
-        size_t in_consumed = in_avail;
-        size_t out_written = out_avail;
-
-        // IDAT is a zlib stream (RFC 1950): PARSE_ZLIB_HEADER is required, else
-        // tinfl expects raw deflate and misparses the zlib header. Only promise
-        // more input while some remains; promising it at EOF makes tinfl wait
-        // forever on a truncated stream.
-        uint32_t flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        if (in_pos < compressed_size) {
-            flags |= TINFL_FLAG_HAS_MORE_INPUT;
-        }
-
-        status = tinfl_decompress(&inflator, compressed + in_pos, &in_consumed, raw, raw + out_pos,
-                                  &out_written, flags);
-
-        in_pos += in_consumed;
-        out_pos += out_written;
-
-        if (status < 0) {
-            ESP_LOGE(TAG, "PNG: inflate failed: %d", status);
-            heap_caps_free(compressed);
-            heap_caps_free(raw);
-            error = ImageError::kCorrupt;
-            return nullptr;
-        }
-        // Zero progress with a non-final status means truncated input or an
-        // output buffer too small for the stream; bail out instead of spinning.
-        if (in_consumed == 0 && out_written == 0) {
-            ESP_LOGE(TAG, "PNG: inflate stalled at %zu/%zu", out_pos, raw_size);
-            heap_caps_free(compressed);
-            heap_caps_free(raw);
-            error = ImageError::kCorrupt;
-            return nullptr;
-        }
-    }
-
-    // Compressed data is no longer needed; free it before the RGB565 allocation
-    // to lower peak PSRAM usage.
-    heap_caps_free(compressed);
-
-    if (out_pos < raw_size) {
-        // Continuing would unfilter and convert uninitialized PSRAM rows.
-        ESP_LOGE(TAG, "PNG: incomplete inflate: %zu/%zu", out_pos, raw_size);
-        heap_caps_free(raw);
-        error = ImageError::kCorrupt;
-        return nullptr;
-    }
-
-    // Unfilter scanlines
-    for (uint32_t y = 0; y < height && y * stride < out_pos; y++) {
-        uint8_t* line = raw + y * stride;
-        uint8_t filter = line[0];
-        if (filter > 4) {
-            ESP_LOGE(TAG, "PNG: bad filter %u at row %lu", filter, y);
-            heap_caps_free(raw);
-            error = ImageError::kCorrupt;
-            return nullptr;
-        }
-        uint8_t* prev = (y > 0) ? (line - stride + 1) : nullptr;
-
-        for (size_t x = 1; x < stride; x++) {
-            uint8_t left = (x > bytes_per_pixel) ? line[x - bytes_per_pixel] : 0;
-            uint8_t up = prev ? prev[x - 1] : 0;
-            uint8_t up_left = (prev && x > bytes_per_pixel) ? prev[x - 1 - bytes_per_pixel] : 0;
-
-            if (filter == 1) {  // Sub
-                line[x] = line[x] + left;
-            } else if (filter == 2) {  // Up
-                line[x] = line[x] + up;
-            } else if (filter == 3) {  // Average
-                line[x] = line[x] + ((left + up) / 2);
-            } else if (filter == 4) {  // Paeth
-                int p = left + up - up_left;
-                int pa = abs(p - left), pb = abs(p - up), pc = abs(p - up_left);
-                uint8_t predictor = (pa <= pb && pa <= pc) ? left : (pb <= pc) ? up : up_left;
-                line[x] = line[x] + predictor;
-            }
-        }
-    }
-
-    // Convert to RGB565 with scaling
+    // 缩放比例与输出尺寸（与 BMP/JPEG 一致，只缩不放）。
     int scale = 1;
     while (width / scale > (uint32_t)max_width || height / scale > (uint32_t)max_height) {
         scale++;
     }
-
     uint32_t out_width = width / scale;
     uint32_t out_height = height / scale;
-    size_t out_size = out_width * out_height * 2;
+    // 极端长宽比（如 10x8192）缩放后某维为 0，out_size=0 会让 malloc(0) 返回 NULL
+    // 而误报"内存不足"。明确按过大/不支持处理。
+    if (out_width == 0 || out_height == 0) {
+        ESP_LOGW(TAG, "PNG: extreme aspect ratio, scaled dimension is zero");
+        error = ImageError::kTooLarge;
+        return nullptr;
+    }
+    size_t out_size = (size_t)out_width * out_height * 2;
 
-    uint8_t* rgb565 = static_cast<uint8_t*>(heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM));
-    if (rgb565 == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %zu bytes for RGB565", out_size);
-        heap_caps_free(raw);
+    // tinfl 环形输出缓冲：必须恰为 TINFL_LZ_DICT_SIZE（32KB）。miniz 的 LZ 回溯
+    // 按该常量取模（结构体里只有 m_dist_from_out_buf_start，没有缓冲尺寸字段），
+    // 缓冲更大反而会破坏回溯引用。它与 stride 无关：行数据被增量 drain 到行缓冲。
+    PngScratch ring_buf;
+    uint8_t* ring = ring_buf.Alloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM);
+    // 两个行缓冲：cur 累积当前行，prev 保存上一行已 unfilter 的像素。
+    PngScratch row_a, row_b;
+    uint8_t* buf_a = row_a.Alloc(stride, MALLOC_CAP_SPIRAM);
+    uint8_t* buf_b = row_b.Alloc(stride, MALLOC_CAP_SPIRAM);
+    // RGB565 输出位图（已缩放到屏幕大小，≤~150KB）。
+    PngScratch out_buf;
+    uint8_t* rgb565 = out_buf.Alloc(out_size, MALLOC_CAP_SPIRAM);
+    if (ring == nullptr || buf_a == nullptr || buf_b == nullptr || rgb565 == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate PNG streaming buffers");
         error = ImageError::kNoMemory;
         return nullptr;
     }
 
-    for (uint32_t y = 0; y < out_height; y++) {
-        for (uint32_t x = 0; x < out_width; x++) {
-            uint32_t src_y = (y * scale) < height ? (y * scale) : (height - 1);
-            uint32_t src_x = (x * scale) < width ? (x * scale) : (width - 1);
-            uint8_t* pixel = raw + src_y * stride + 1 + src_x * bytes_per_pixel;
-
-            uint8_t r = 0, g = 0, b = 0;
-            if (color_type == 0) {  // Grayscale
-                r = g = b = pixel[0];
-            } else if (color_type == 4) {  // Grayscale + alpha (alpha ignored)
-                r = g = b = pixel[0];
-            } else if (color_type == 2) {  // RGB
-                r = pixel[0];
-                g = pixel[1];
-                b = pixel[2];
-            } else if (color_type == 6) {  // RGBA
-                r = pixel[0];
-                g = pixel[1];
-                b = pixel[2];
-            }
-
-            uint16_t rgb565_pixel = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            rgb565[(y * out_width + x) * 2] = rgb565_pixel & 0xFF;
-            rgb565[(y * out_width + x) * 2 + 1] = rgb565_pixel >> 8;
+    // 处理一整行：用 prev 行做 PNG unfilter（None/Sub/Up/Average/Paeth），再按
+    // scale 采样转 RGB565 写入输出。row_y 为源行号；返回 false 表示 filter 非法。
+    // cur[0] 是 filter 字节，cur[1..stride) 是像素；prev 同样布局。
+    auto process_row = [&](uint8_t* cur, const uint8_t* prev, uint32_t row_y) -> bool {
+        uint8_t filter = cur[0];
+        if (filter > 4) {
+            ESP_LOGE(TAG, "PNG: bad filter %u at row %lu", filter, row_y);
+            return false;
         }
+        bool has_up = (row_y > 0);
+        if (filter != 0) {
+            for (size_t x = 1; x < stride; x++) {
+                uint8_t left = (x > bytes_per_pixel) ? cur[x - bytes_per_pixel] : 0;
+                uint8_t up = has_up ? prev[x] : 0;
+                uint8_t up_left = (has_up && x > bytes_per_pixel) ? prev[x - bytes_per_pixel] : 0;
+                uint8_t v = cur[x];
+                if (filter == 1) {  // Sub
+                    v = v + left;
+                } else if (filter == 2) {  // Up
+                    v = v + up;
+                } else if (filter == 3) {  // Average
+                    v = v + ((left + up) / 2);
+                } else {  // Paeth
+                    int p = left + up - up_left;
+                    int pa = abs(p - left), pb = abs(p - up), pc = abs(p - up_left);
+                    uint8_t predictor = (pa <= pb && pa <= pc) ? left : (pb <= pc) ? up : up_left;
+                    v = v + predictor;
+                }
+                cur[x] = v;
+            }
+        }
+        // 仅在采样行写入输出位图。必须校验 out_y < out_height：out_height 是
+        // floor(height/scale)，当 height 不能被 scale 整除时最后一个采样源行会映射到
+        // out_y == out_height，越界写一行（堆溢出）。丢弃尾部不足一个采样块的源行。
+        if (row_y % (uint32_t)scale == 0 && row_y / (uint32_t)scale < out_height) {
+            uint32_t out_y = row_y / scale;
+            uint8_t* dst = rgb565 + (size_t)out_y * out_width * 2;
+            // 16-bit 时每通道 2 字节大端，取各通道高字节须按通道步长 cs 偏移，
+            // 否则 RGB/RGBA 会读到 R_hi,R_lo,G_hi 而非 R_hi,G_hi,B_hi。
+            const size_t cs = bit_depth / 8;
+            for (uint32_t x = 0; x < out_width; x++) {
+                uint32_t src_x = (x * scale) < width ? (x * scale) : (width - 1);
+                const uint8_t* pixel = cur + 1 + (size_t)src_x * bytes_per_pixel;
+                uint8_t r = 0, g = 0, b = 0;
+                if (color_type == 0 || color_type == 4) {  // 灰度 / 灰度+alpha（忽略 alpha）
+                    r = g = b = pixel[0];
+                } else if (color_type == 2) {  // RGB
+                    r = pixel[0];
+                    g = pixel[cs];
+                    b = pixel[2 * cs];
+                } else {  // RGBA（忽略 alpha）
+                    r = pixel[0];
+                    g = pixel[cs];
+                    b = pixel[2 * cs];
+                }
+                uint16_t rgb565_pixel = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+                dst[x * 2] = rgb565_pixel & 0xFF;
+                dst[x * 2 + 1] = rgb565_pixel >> 8;
+            }
+        }
+        return true;
+    };
+
+    // tinfl 流式 inflate（环形模式）。零初始化确保 m_dist_from_out_buf_start 从 0
+    // 起，与 ring_ofs 同步推进，LZ 回溯取模才正确（ROM 测试也用 calloc 清零）。
+    tinfl_decompressor inflator{};
+    tinfl_init(&inflator);
+    size_t in_pos = 0;
+    size_t ring_ofs = 0;  // 环形缓冲写偏移 = 已产出字节数 % TINFL_LZ_DICT_SIZE
+    size_t row_fill = 0;  // cur 行已累积字节数
+    uint32_t row_y = 0;   // 已完成的源行数
+    uint8_t* cur = buf_a;
+    uint8_t* prev = buf_b;
+    int status = TINFL_STATUS_NEEDS_MORE_INPUT;
+
+    while (row_y < height &&
+           (status == TINFL_STATUS_NEEDS_MORE_INPUT || status == TINFL_STATUS_HAS_MORE_OUTPUT)) {
+        size_t in_avail = compressed_size - in_pos;
+        // 只给出到环形缓冲末尾的连续空间，tinfl 单次产出不会跨越末尾。
+        size_t out_avail = TINFL_LZ_DICT_SIZE - ring_ofs;
+        size_t in_consumed = in_avail;
+        size_t out_written = out_avail;
+
+        // IDAT 是 zlib 流（RFC1950），必须 PARSE_ZLIB_HEADER；环形模式不设
+        // USING_NON_WRAPPING_OUTPUT_BUF。仅在仍有输入时承诺 HAS_MORE_INPUT，
+        // 否则截断流会让 tinfl 永远等待。
+        uint32_t flags = TINFL_FLAG_PARSE_ZLIB_HEADER;
+        if (in_pos < compressed_size) {
+            flags |= TINFL_FLAG_HAS_MORE_INPUT;
+        }
+
+        status = tinfl_decompress(&inflator, compressed + in_pos, &in_consumed, ring,
+                                  ring + ring_ofs, &out_written, flags);
+        in_pos += in_consumed;
+
+        if (status < 0) {
+            ESP_LOGE(TAG, "PNG: inflate failed: %d", status);
+            error = ImageError::kCorrupt;
+            return nullptr;
+        }
+        // 零进展且非完成态：输入截断或流异常，退出而非死循环。
+        if (in_consumed == 0 && out_written == 0 && status != TINFL_STATUS_DONE) {
+            ESP_LOGE(TAG, "PNG: inflate stalled at row %lu", row_y);
+            error = ImageError::kCorrupt;
+            return nullptr;
+        }
+
+        // 把本次产出的连续字节 drain 进行缓冲；凑满 stride 字节就处理一行。
+        // 一行可跨多次 inflate 调用（stride 可大于环形缓冲），row_fill 跨调用累积，
+        // 因此行数据不会因环形回绕而丢失。
+        const uint8_t* src = ring + ring_ofs;
+        size_t remaining = out_written;
+        while (remaining > 0 && row_y < height) {
+            size_t need = stride - row_fill;
+            size_t take = (remaining < need) ? remaining : need;
+            memcpy(cur + row_fill, src, take);
+            row_fill += take;
+            src += take;
+            remaining -= take;
+            if (row_fill == stride) {
+                if (!process_row(cur, prev, row_y)) {
+                    error = ImageError::kCorrupt;
+                    return nullptr;
+                }
+                uint8_t* tmp = cur;
+                cur = prev;
+                prev = tmp;
+                row_y++;
+                row_fill = 0;
+            }
+        }
+
+        ring_ofs = (ring_ofs + out_written) & (TINFL_LZ_DICT_SIZE - 1);
     }
 
-    heap_caps_free(raw);
+    if (row_y < height) {
+        ESP_LOGE(TAG, "PNG: incomplete inflate: %lu/%lu rows", row_y, height);
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
 
-    // nothrow: exceptions are disabled, a throwing new would abort() on OOM.
+    // 所有行已在流式循环中 unfilter 并缩放完毕，这里只组装结果。
+    // nothrow：异常被禁用，抛出的 new 会在 OOM 时 abort()。
     auto image = std::unique_ptr<DecodedImage>(new (std::nothrow) DecodedImage());
     if (image == nullptr) {
-        heap_caps_free(rgb565);
         error = ImageError::kNoMemory;
         return nullptr;
     }
     image->kind = DecodedImage::Kind::kBitmap;
     image->width = out_width;
     image->height = out_height;
-    image->data = rgb565;
+    image->data = out_buf.Release();  // 输出位图所有权转交给 DecodedImage
     image->size = out_size;
     error = ImageError::kNone;
     ESP_LOGI(TAG, "PNG decoded: %lux%lu -> %dx%d", width, height, out_width, out_height);

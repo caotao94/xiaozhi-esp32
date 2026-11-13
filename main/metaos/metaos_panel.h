@@ -107,6 +107,10 @@ private:
     void ShowTextViewer(const std::string& path);
     void CloseFileViewer();
     void OnImageDecoded(void* decoded_image, const std::string& path);
+    // 文本分页：工作线程读取一页，主任务更新界面。工作队列满时返回 false。
+    bool LoadTextPage(long offset);
+    // 刷新位置指示与上一页/下一页按钮状态。需持 LVGL 锁。
+    void UpdateTextPager();
 
     void OpenAlert(const char* icon, const std::string& title, const std::string& body,
                    int timeout_ms);
@@ -133,6 +137,9 @@ private:
     // Touch callbacks referenced by LVGL event user data. Freed after their widgets.
     std::vector<Button*> page_buttons_;
     std::vector<Button*> alert_buttons_;
+    // 文件查看器（文本/图片）的按钮单独存放，CloseFileViewer 时立即释放，
+    // 避免在文件页内反复开合查看器时累积到 page_buttons_（后者仅在切页时释放）。
+    std::vector<Button*> viewer_buttons_;
     std::vector<Button*>* building_buttons_ = &page_buttons_;
 
     Page page_ = Page::kHome;
@@ -150,6 +157,19 @@ private:
     void* loading_spinner_ = nullptr;
     void* gif_player_ = nullptr;  // LvglGif* when viewing a GIF
     void* image_dsc_ = nullptr;   // lv_img_dsc_t* for static images, needs manual cleanup
+
+    // 文本分页状态（仅主任务访问）。路径复用 viewing_file_；页内容只保存在 label 里，
+    // 不随文件增大而增加内存。翻页历史用于"上一页"。
+    long text_offset_ = 0;            // 当前页起始字节偏移
+    long text_next_offset_ = 0;       // 下一页起始偏移（末页时等于 text_size_）
+    long text_size_ = 0;              // 文件总字节数
+    std::vector<long> text_history_;  // 之前各页的起始偏移
+    unsigned text_session_ = 0;       // 每次打开递增，用于丢弃过期的翻页结果
+    bool text_loading_ = false;       // 有翻页读取正在进行
+    void* text_label_ = nullptr;
+    void* text_prev_button_ = nullptr;
+    void* text_next_button_ = nullptr;
+    void* text_position_label_ = nullptr;
 
     void* alert_ = nullptr;
     void* alert_bar_ = nullptr;
