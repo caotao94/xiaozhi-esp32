@@ -1,4 +1,16 @@
 # Define source files
+if(CONFIG_METAOS_RESCUE_MODE)
+    # Minimal factory rescue app: no audio/protocols/MCP/MetaOS panel/cloud.
+    set(SOURCES
+        "main.cc"
+        "settings.cc"
+        "rescue/rescue_main.cc"
+        "rescue/rescue_ui.cc"
+        "rescue/rescue_font.c"
+        "firmware/firmware_repo.cc"
+        "firmware/firmware_install.cc"
+    )
+else()
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_debugger.cc"
             "audio/audio_service.cc"
@@ -42,28 +54,40 @@ set(SOURCES "audio/audio_codec.cc"
             "assets.cc"
             "main.cc"
             )
+endif()
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+if(CONFIG_METAOS_RESCUE_MODE)
+    list(APPEND INCLUDE_DIRS "rescue" "firmware")
+endif()
 
 # Add board common files
-list(APPEND SOURCES
-    "boards/common/board.cc"
-    "boards/common/wifi_board.cc"
-    "boards/common/ml307_board.cc"
-    "boards/common/nt26_board.cc"
-    "boards/common/dual_network_board.cc"
-    "boards/common/adc_battery_monitor.cc"
-    "boards/common/axp2101.cc"
-    "boards/common/backlight.cc"
-    "boards/common/button.cc"
-    "boards/common/i2c_device.cc"
-    "boards/common/knob.cc"
-    "boards/common/power_save_timer.cc"
-    "boards/common/press_to_talk_mcp_tool.cc"
-    "boards/common/sleep_timer.cc"
-    "boards/common/sy6970.cc"
-    "boards/common/system_reset.cc"
-)
+if(CONFIG_METAOS_RESCUE_MODE)
+    list(APPEND SOURCES
+        "boards/common/i2c_device.cc"
+        "boards/common/backlight.cc"
+        "boards/common/sd_card.cc"
+    )
+else()
+    list(APPEND SOURCES
+        "boards/common/board.cc"
+        "boards/common/wifi_board.cc"
+        "boards/common/ml307_board.cc"
+        "boards/common/nt26_board.cc"
+        "boards/common/dual_network_board.cc"
+        "boards/common/adc_battery_monitor.cc"
+        "boards/common/axp2101.cc"
+        "boards/common/backlight.cc"
+        "boards/common/button.cc"
+        "boards/common/i2c_device.cc"
+        "boards/common/knob.cc"
+        "boards/common/power_save_timer.cc"
+        "boards/common/press_to_talk_mcp_tool.cc"
+        "boards/common/sleep_timer.cc"
+        "boards/common/sy6970.cc"
+        "boards/common/system_reset.cc"
+    )
+endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET)
     list(APPEND SOURCES "boards/common/ethernet_board.cc")
 endif()
@@ -81,8 +105,11 @@ if(CONFIG_METAOS_ENABLE)
         "metaos/metaos_reminders.cc"
         "metaos/metaos_speech.cc"
         "metaos/metaos_worker.cc"
+        "metaos/metaos_firmware.cc"
+        "firmware/firmware_repo.cc"
+        "firmware/firmware_install.cc"
     )
-    list(APPEND INCLUDE_DIRS "metaos")
+    list(APPEND INCLUDE_DIRS "metaos" "firmware")
 endif()
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
@@ -1018,15 +1045,21 @@ file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/*.c
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
+if(CONFIG_METAOS_RESCUE_MODE)
+    # Rescue app includes the board-specific header (RescueBoard).
+    list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR})
+endif()
 
-# Select one audio engine for each chip family
-if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
-    list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
-    list(APPEND SOURCES "audio/wake_words/custom_wake_word.cc")
-    list(APPEND SOURCES "audio/wake_words/wake_word_audio_cache.cc")
-else()
-    list(APPEND SOURCES "audio/engines/lite_audio_engine.cc")
-    list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
+# Select one audio engine for each chip family (rescue has no audio)
+if(NOT CONFIG_METAOS_RESCUE_MODE)
+    if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
+        list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
+        list(APPEND SOURCES "audio/wake_words/custom_wake_word.cc")
+        list(APPEND SOURCES "audio/wake_words/wake_word_audio_cache.cc")
+    else()
+        list(APPEND SOURCES "audio/engines/lite_audio_engine.cc")
+        list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
+    endif()
 endif()
 
 # Auto Select Additional Sources
@@ -1162,8 +1195,8 @@ if(CONFIG_IDF_TARGET_ESP32)
                              )
 endif()
 
-# Include EspVideo if target is ESP32S3 or ESP32P4
-if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
+# Include EspVideo if target is ESP32S3 or ESP32P4 (not in rescue)
+if((CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4) AND NOT CONFIG_METAOS_RESCUE_MODE)
     list(APPEND SOURCES "boards/common/esp_video.cc"
                         "boards/common/rndis_board.cc"
                         )
@@ -1178,8 +1211,8 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C5_TOUCH_LCD_3_5)
     list(APPEND SOURCES "boards/common/esp_video.cc")
 endif()
 
-# Include Esp32Camera if target is ESP32S3
-if(CONFIG_IDF_TARGET_ESP32S3)
+# Include Esp32Camera if target is ESP32S3 (not in rescue)
+if(CONFIG_IDF_TARGET_ESP32S3 AND NOT CONFIG_METAOS_RESCUE_MODE)
     list(APPEND SOURCES "boards/common/esp32_camera.cc")
 endif()
 
@@ -1209,6 +1242,12 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD OR CONFIG_METAOS_ENABLE)
         sdmmc
     )
 endif()
+if(CONFIG_METAOS_RESCUE_MODE)
+    # Rescue app embeds no prompt sounds.
+    set(LANG_SOUNDS "")
+    set(COMMON_SOUNDS "")
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
@@ -1231,6 +1270,7 @@ idf_component_register(SRCS ${SOURCES}
                         app_update
                         spi_flash
                         mbedtls
+                        espressif__cjson
                         console
                         efuse
                         bt

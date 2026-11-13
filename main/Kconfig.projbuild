@@ -1228,10 +1228,30 @@ endmenu
 menu "MetaOS"
     depends on BOARD_TYPE_LICHUANG_DEV_S3
 
+    config METAOS_RESCUE_MODE
+        bool "MetaOS Factory Rescue firmware (minimal, independent)"
+        default n
+        depends on SPIRAM && IDF_TARGET_ESP32S3
+        help
+            Builds the minimal factory rescue application instead of the full
+            XiaoZhi app: LCD + touch + SD card, firmware repository scan,
+            SHA-256 verification, OTA install to ota_0/ota_1 and boot switching.
+            No audio, Bluetooth, MetaOS panel, MCP or cloud dependency.
+
+    config METAOS_FW_REQUIRE_SIGNATURE
+        bool "Require signed firmware manifests for TF-card install"
+        default n
+        depends on METAOS_ENABLE || METAOS_RESCUE_MODE
+        help
+            When enabled, installing firmware from the TF-card repository requires
+            a valid ECDSA P-256 manifest signature (unsigned images are rejected).
+            When disabled, unsigned images are allowed but an invalid signature is
+            always rejected. SHA-256 integrity is always required.
+
     config METAOS_ENABLE
         bool "Enable MetaOS V2 (SD card, local agent tools)"
         default n
-        depends on SPIRAM
+        depends on SPIRAM && !METAOS_RESCUE_MODE
         help
             Mounts the TF card (SDMMC 1-bit: CLK GPIO47, CMD GPIO48, D0 GPIO21) and adds
             MCP tools for reminders and local Ogg music playback, plus a touch UI

@@ -9,6 +9,9 @@
 #define METAOS_PANEL_ENABLED 1
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <lvgl.h>
 #include <material_symbols.h>
@@ -19,9 +22,12 @@
 #include "application.h"
 #include "board.h"
 #include "display/lvgl_display/gif/lvgl_gif.h"
+#include "firmware_install.h"
+#include "firmware_repo.h"
 #include "lvgl_theme.h"
 #include "metaos_common.h"
 #include "metaos_files.h"
+#include "metaos_firmware.h"
 #include "metaos_image.h"
 #include "metaos_music.h"
 #include "metaos_strings.h"
@@ -46,6 +52,8 @@ namespace {
 constexpr int kLockTimeoutMs = 1000;
 constexpr int kToastMs = 2500;
 constexpr int kReminderAlertMs = 3 * 60 * 1000;
+// Firmware confirmations time out to "cancel" if the user walks away.
+constexpr int kFwDialogMs = 30 * 1000;
 constexpr size_t kTracksPerPage = 30;
 
 class LvglLock {
@@ -129,6 +137,70 @@ std::string FormatUsage(uint64_t total, uint64_t free) {
     return buffer;
 }
 
+const esp_partition_t* OtaPartition(int slot) {
+    return esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        slot == 0 ? ESP_PARTITION_SUBTYPE_APP_OTA_0 : ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
+}
+
+// Running partition, next boot and the state of all three slots, one line each.
+std::string FirmwareOverview() {
+    firmware::SlotInfo running = firmware::FirmwareInstall::Running();
+    firmware::SlotInfo boot = firmware::FirmwareInstall::BootSelected();
+    std::string text = "运行: " + running.label;
+    if (!running.version.empty()) {
+        text += " · " + running.version;
+    }
+    text += "\n下次启动: " + boot.label;
+    for (const auto& slot : firmware::FirmwareInstall::Slots()) {
+        text += "\n" + slot.label + ": ";
+        if (slot.part == nullptr) {
+            text += "不存在";
+            continue;
+        }
+        if (slot.valid_image) {
+            text += slot.version.empty() ? "未知版本" : slot.version.c_str();
+        } else {
+            text += "无有效镜像";
+        }
+        text += std::string(" (") + firmware::FirmwareInstall::StateName(slot.state) + ")";
+    }
+    return text;
+}
+
+// Fingerprint of the repository list plus the last scan/install error. RefreshFirmware
+// rebuilds the page only when a rescan changed something (same entry count with
+// different content included, or a new error on an empty repository).
+unsigned FirmwareRevision(const std::vector<firmware::FirmwareEntry>& entries,
+                          const std::string& last_error) {
+    unsigned revision = static_cast<unsigned>(entries.size());
+    auto fold = [&revision](const std::string& text) {
+        for (char c : text) {
+            revision = revision * 31u + static_cast<unsigned char>(c);
+        }
+    };
+    fold(last_error);
+    for (const auto& entry : entries) {
+        fold(entry.name);
+        fold(entry.version);
+        fold(entry.error);
+        fold(entry.bin_path);
+        revision = revision * 31u + static_cast<unsigned>(entry.size);
+        revision = revision * 31u + (entry.has_signature ? 1u : 0u);
+        revision = revision * 31u + (entry.sha256_ok ? 1u : 0u);
+    }
+    return revision;
+}
+
+// Visually mute a button that must not be tapped (running slot, missing partition).
+// LVGL does not deliver clicks to disabled objects.
+void DisableButton(void* button, LvglTheme* theme) {
+    lv_obj_t* obj = Obj(button);
+    lv_obj_add_state(obj, LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(obj, SecondaryText(theme), LV_STATE_DISABLED);
+    lv_obj_set_style_text_opa(obj, LV_OPA_50, LV_STATE_DISABLED);
+}
+
 void DispatchTap(lv_event_t* event) {
     auto* button = static_cast<MetaPanel::Button*>(lv_event_get_user_data(event));
     if (button == nullptr || !button->on_tap) {
@@ -142,13 +214,14 @@ void DispatchTap(lv_event_t* event) {
 }  // namespace
 
 MetaPanel::MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
-                     MetaSettings& settings, Hooks hooks)
+                     MetaSettings& settings, FirmwareManager& firmware, Hooks hooks)
     : storage_(storage),
       music_(music),
       reminders_(reminders),
       file_browser_(
           new FileBrowser(storage, {.on_file_changed = [this]() { Open(Page::kFiles); }})),
       settings_(settings),
+      firmware_(firmware),
       hooks_(std::move(hooks)) {}
 
 MetaPanel::~MetaPanel() {
@@ -433,6 +506,13 @@ void MetaPanel::ClearPageRefs() {
     for (auto& label : tile_labels_) {
         label = nullptr;
     }
+    fw_status_area_ = nullptr;
+    fw_list_area_ = nullptr;
+    fw_progress_bar_ = nullptr;
+    fw_progress_label_ = nullptr;
+    fw_cancel_button_ = nullptr;
+    // fw_selected_index_ is not a widget pointer: it survives page rebuilds and is
+    // reset when the repository content changes.
 }
 
 void MetaPanel::Open(Page page) {
@@ -489,6 +569,9 @@ void MetaPanel::Open(Page page) {
         case Page::kSettings:
             BuildSettings();
             break;
+        case Page::kFirmware:
+            BuildFirmware();
+            break;
         case Page::kImage:
         case Page::kText:
             // These are handled by ShowImageViewer/ShowTextViewer, not BuildX methods
@@ -540,6 +623,9 @@ void MetaPanel::RefreshLocked() {
         case Page::kText:
         case Page::kSettings:
             // Static pages: nothing to refresh on a timer.
+            break;
+        case Page::kFirmware:
+            RefreshFirmware();
             break;
     }
 }
@@ -969,6 +1055,353 @@ void MetaPanel::BuildSettings() {
     });
 
     AddLabel(area, text::kVoiceHint, true);
+
+    // Firmware management: install / switch images from the TF-card repository.
+    AddTextButton(area, "固件管理", [this]() { Open(Page::kFirmware); });
+}
+
+void MetaPanel::BuildFirmware() {
+    const auto& entries = firmware_.entries();
+    shown_revision_ = FirmwareRevision(entries, firmware_.last_error());
+    if (fw_selected_index_ >= static_cast<int>(entries.size())) {
+        fw_selected_index_ = -1;
+    }
+    AddHeader(MATERIAL_SYMBOLS_MEMORY, "固件管理");
+    lv_obj_t* area = Obj(AddScrollArea());
+    list_area_ = area;
+
+    // Slot overview: running partition, next boot and all three slots.
+    fw_status_area_ = Box(area);
+    lv_obj_set_width(Obj(fw_status_area_), LV_PCT(100));
+    lv_obj_set_height(Obj(fw_status_area_), LV_SIZE_CONTENT);
+    AddLabel(fw_status_area_, FirmwareOverview());
+
+    // Second confirmation for a destructive install: overwrite one OTA slot. The
+    // heavy verify/write work runs on the FirmwareManager worker, never here.
+    auto confirm_target = [this](const firmware::FirmwareEntry& entry, int slot) {
+        LvglLock lock;
+        if (!lock) {
+            return;
+        }
+        theme_ = CurrentTheme();
+        if (theme_ == nullptr || root_ == nullptr || page_ != Page::kFirmware) {
+            return;
+        }
+        if (firmware_.busy()) {
+            ShowToast("任务进行中，请稍候");
+            return;
+        }
+        const esp_partition_t* target = OtaPartition(slot);
+        if (target == nullptr) {
+            ShowToast("目标分区不存在");
+            return;
+        }
+        std::string body = "将覆盖 " + std::string(target->label) + " 分区：\n" + entry.name +
+                           "  " + entry.version + "\n安装过程中请勿断电或拔卡。";
+        OpenAlert(MATERIAL_SYMBOLS_WARNING, "确认安装", body, kFwDialogMs);
+        lv_obj_set_flex_flow(Obj(alert_bar_), LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_style_pad_row(Obj(alert_bar_), 6, 0);
+        AddTextButton(
+            alert_bar_, "确认安装",
+            [this, entry, target]() {
+                CloseAlert();
+                if (!firmware_.RequestInstall(entry, target)) {
+                    ShowToast("无法开始安装");
+                }
+            },
+            true);
+        AddTextButton(alert_bar_, text::kCancel, [this]() { CloseAlert(); });
+        building_buttons_ = &page_buttons_;
+    };
+
+    // Boot switch confirmation. Switch() writes otadata (a brief flash write, same
+    // as the rescue firmware) and the device reboots right after.
+    auto confirm_switch = [this](const esp_partition_t* target) {
+        LvglLock lock;
+        if (!lock) {
+            return;
+        }
+        theme_ = CurrentTheme();
+        if (theme_ == nullptr || root_ == nullptr || page_ != Page::kFirmware) {
+            return;
+        }
+        if (firmware_.busy()) {
+            ShowToast("任务进行中，不能切换启动分区");
+            return;
+        }
+        if (target == nullptr) {
+            ShowToast("目标分区不存在");
+            return;
+        }
+        std::string body = "下次启动将进入 " + std::string(target->label) + "，确认后立即重启。";
+        for (const auto& info : firmware::FirmwareInstall::Slots()) {
+            if (info.part != nullptr && info.part->address == target->address &&
+                !info.valid_image) {
+                body += "\n警告：该分区没有有效镜像，切换后可能无法启动！";
+            }
+        }
+        OpenAlert(MATERIAL_SYMBOLS_WARNING, "切换启动分区", body, kFwDialogMs);
+        lv_obj_set_flex_flow(Obj(alert_bar_), LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_style_pad_row(Obj(alert_bar_), 6, 0);
+        AddTextButton(
+            alert_bar_, "重启并切换",
+            [this, target]() {
+                CloseAlert();
+                // A job may have started since the dialog opened; never write
+                // otadata or reboot while the worker is using the flash.
+                if (firmware_.busy()) {
+                    ShowToast("任务进行中，稍后再试");
+                    return;
+                }
+                std::string err;
+                if (firmware::FirmwareInstall::Switch(target, err)) {
+                    esp_restart();
+                } else {
+                    ShowToast(err);
+                }
+            },
+            true);
+        AddTextButton(alert_bar_, text::kCancel, [this]() { CloseAlert(); });
+        building_buttons_ = &page_buttons_;
+    };
+
+    // TF-card repository.
+    AddLabel(area, "TF 卡仓库", true);
+    AddTextButton(area, "扫描仓库", [this]() {
+        if (firmware_.busy()) {
+            ShowToast("任务进行中，请稍候");
+            return;
+        }
+        firmware_.RequestScan();
+    });
+    fw_list_area_ = Box(area);
+    lv_obj_set_width(Obj(fw_list_area_), LV_PCT(100));
+    lv_obj_set_height(Obj(fw_list_area_), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(Obj(fw_list_area_), LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(Obj(fw_list_area_), 6, 0);
+    if (entries.empty()) {
+        AddLabel(fw_list_area_,
+                 storage_.IsMounted() ? "仓库为空：把固件放入 TF 卡 metaos/firmware 目录"
+                                      : text::kNoCard,
+                 true);
+        if (!firmware_.last_error().empty()) {
+            lv_obj_t* error_label = Obj(AddLabel(fw_list_area_, "错误: " + firmware_.last_error()));
+            lv_obj_set_style_text_color(error_label, lv_color_hex(0xE53935), 0);
+        }
+    }
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        std::string detail = FileBrowser::FormatFileSize(static_cast<size_t>(entry.size));
+        detail += entry.has_signature ? " · [已签名]" : " · [未签名]";
+        if (!entry.error.empty()) {
+            detail += " · [无效]";
+        }
+        AddListRow(
+            fw_list_area_, MATERIAL_SYMBOLS_DOWNLOAD, entry.name + "  " + entry.version, detail,
+            [this, i, entry, confirm_target]() {
+                fw_selected_index_ = static_cast<int>(i);
+                LvglLock lock;
+                if (!lock) {
+                    return;
+                }
+                theme_ = CurrentTheme();
+                if (theme_ == nullptr || root_ == nullptr || page_ != Page::kFirmware) {
+                    return;
+                }
+                if (!entry.error.empty()) {
+                    OpenAlert(MATERIAL_SYMBOLS_WARNING, "固件无效", entry.error, kFwDialogMs);
+                    AddTextButton(alert_bar_, text::kGotIt, [this]() { CloseAlert(); }, true);
+                    building_buttons_ = &page_buttons_;
+                    return;
+                }
+                // First confirmation: choose the target slot. The running slot is
+                // protected and its button is disabled.
+                // The scan only records whether a signature is declared; the actual
+                // signature check happens at install time, so say exactly that.
+                std::string body =
+                    entry.name + "  " + entry.version +
+                    "\n大小: " + FileBrowser::FormatFileSize(static_cast<size_t>(entry.size)) +
+                    "\n" + (entry.has_signature ? "已签名（安装时验签）" : "未签名") +
+                    "\n安装时校验 SHA-256 与签名，无效签名一律拒绝";
+#if CONFIG_METAOS_FW_REQUIRE_SIGNATURE
+                if (!entry.has_signature) {
+                    body += "\n当前策略要求签名，未签名将被拒绝";
+                }
+#endif
+                body += "\n选择安装目标分区：";
+                OpenAlert(MATERIAL_SYMBOLS_DOWNLOAD, "安装固件", body, kFwDialogMs);
+                lv_obj_set_flex_flow(Obj(alert_bar_), LV_FLEX_FLOW_ROW_WRAP);
+                lv_obj_set_style_pad_row(Obj(alert_bar_), 6, 0);
+                const esp_partition_t* running = esp_ota_get_running_partition();
+                for (int slot = 0; slot < 2; ++slot) {
+                    const esp_partition_t* target = OtaPartition(slot);
+                    std::string label = slot == 0 ? "装到 ota_0" : "装到 ota_1";
+                    bool disabled = false;
+                    if (target == nullptr) {
+                        label += "（不存在）";
+                        disabled = true;
+                    } else if (running != nullptr && target->address == running->address) {
+                        label += "（运行中）";
+                        disabled = true;
+                    }
+                    lv_obj_t* button =
+                        Obj(AddTextButton(alert_bar_, label, [this, entry, slot, confirm_target]() {
+                            confirm_target(entry, slot);
+                        }));
+                    if (disabled) {
+                        DisableButton(button, theme_);
+                    }
+                }
+                AddTextButton(alert_bar_, text::kCancel, [this]() { CloseAlert(); });
+                building_buttons_ = &page_buttons_;
+            },
+            static_cast<int>(i) == fw_selected_index_);
+    }
+
+    // Boot switching.
+    AddLabel(area, "启动切换", true);
+    lv_obj_t* switch_row = Box(area);
+    lv_obj_set_width(switch_row, LV_PCT(100));
+    lv_obj_set_height(switch_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(switch_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(switch_row, 8, 0);
+    lv_obj_set_style_pad_row(switch_row, 6, 0);
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    for (int slot = 0; slot < 2; ++slot) {
+        const esp_partition_t* target = OtaPartition(slot);
+        std::string label = slot == 0 ? "启动 ota_0" : "启动 ota_1";
+        bool disabled = false;
+        if (target == nullptr) {
+            label += "（不存在）";
+            disabled = true;
+        } else if (running != nullptr && target->address == running->address) {
+            label += "（运行中）";
+            disabled = true;
+        }
+        lv_obj_t* button = Obj(AddTextButton(
+            switch_row, label, [this, target, confirm_switch]() { confirm_switch(target); }));
+        if (disabled) {
+            DisableButton(button, theme_);
+        }
+    }
+    // Enter the factory rescue system.
+    const esp_partition_t* factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+    std::string rescue_label = "进入救援模式";
+    bool rescue_disabled = false;
+    if (factory == nullptr) {
+        rescue_label += "（不存在）";
+        rescue_disabled = true;
+    } else if (running != nullptr && factory->address == running->address) {
+        rescue_label += "（运行中）";
+        rescue_disabled = true;
+    }
+    lv_obj_t* rescue_button = Obj(AddTextButton(
+        switch_row, rescue_label,
+        [this, factory, confirm_switch]() { confirm_switch(factory); }));
+    if (rescue_disabled) {
+        DisableButton(rescue_button, theme_);
+    }
+
+    // Progress. The cancel button is tracked in fw_cancel_button_; RefreshFirmware
+    // shows it only while verify/write is running (a scan cannot be cancelled).
+    fw_progress_bar_ = lv_bar_create(area);
+    lv_obj_set_width(Obj(fw_progress_bar_), LV_PCT(100));
+    lv_obj_set_height(Obj(fw_progress_bar_), 10);
+    lv_bar_set_range(Obj(fw_progress_bar_), 0, 100);
+    lv_bar_set_value(Obj(fw_progress_bar_), 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(Obj(fw_progress_bar_), Accent(), LV_PART_INDICATOR);
+    fw_progress_label_ = AddLabel(area, "空闲");
+    fw_cancel_button_ = AddTextButton(area, text::kCancel, [this]() { firmware_.Cancel(); });
+    lv_obj_add_flag(Obj(fw_cancel_button_), LV_OBJ_FLAG_HIDDEN);
+}
+
+void MetaPanel::RefreshFirmware() {
+    if (fw_progress_bar_ == nullptr || fw_progress_label_ == nullptr || list_area_ == nullptr) {
+        return;
+    }
+    // Consume a finished install exactly once (Poll already moved the worker result
+    // into main-task state). An empty error means success.
+    if (firmware_.has_result()) {
+        firmware::FirmwareEntry entry = firmware_.installed();
+        const esp_partition_t* target = firmware_.install_target();
+        std::string error = firmware_.last_error();
+        firmware_.AcknowledgeResult();
+        if (error.empty()) {
+            std::string message = "安装成功";
+            if (!entry.name.empty()) {
+                message += ": " + entry.name;
+            }
+            if (target != nullptr) {
+                message += std::string("，已写入 ") + target->label;
+            }
+            ShowToast(message);
+        } else {
+            if (theme_ == nullptr) {
+                theme_ = CurrentTheme();
+            }
+            if (theme_ != nullptr) {
+                OpenAlert(MATERIAL_SYMBOLS_WARNING, "安装失败", error, kFwDialogMs);
+                AddTextButton(alert_bar_, text::kGotIt, [this]() { CloseAlert(); }, true);
+                building_buttons_ = &page_buttons_;
+            } else {
+                ShowToast("安装失败: " + error);
+            }
+        }
+    }
+
+    // Progress bar + phase label. Cancel is only offered during verify/write:
+    // Cancel() cannot interrupt a scan, and the terminal states need no cancel.
+    lv_obj_t* bar = Obj(fw_progress_bar_);
+    lv_obj_t* cancel = Obj(fw_cancel_button_);
+    std::string progress = "空闲";
+    int percent = 0;
+    bool cancellable = false;
+    if (firmware_.busy()) {
+        percent = firmware_.percent();
+        switch (firmware_.phase()) {
+            case FirmwareManager::Phase::kScanning:
+                progress = "扫描中...";
+                percent = 0;  // scans have no byte progress
+                break;
+            case FirmwareManager::Phase::kVerify:
+                progress = "校验 SHA-256... " + std::to_string(percent) + "%";
+                cancellable = true;
+                break;
+            case FirmwareManager::Phase::kWrite:
+                progress = "写入 " + std::to_string(percent) + "%";
+                cancellable = true;
+                break;
+            default:
+                break;
+        }
+    }
+    if (cancel != nullptr) {
+        if (cancellable) {
+            lv_obj_remove_flag(cancel, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(cancel, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (lv_bar_get_value(bar) != percent) {
+        lv_bar_set_value(bar, percent, LV_ANIM_OFF);
+    }
+    SetLabel(fw_progress_label_, progress);
+
+    // Rebuild only when a rescan changed the repository; Open keeps the scroll position
+    // and re-runs RefreshFirmware with the new revision recorded, so this does not loop.
+    unsigned revision = FirmwareRevision(firmware_.entries(), firmware_.last_error());
+    if (revision != shown_revision_) {
+        fw_selected_index_ = -1;
+        Open(Page::kFirmware);
+        return;
+    }
+
+    // Overview: reading slot state touches flash, so keep the previous text while
+    // a job is running. Otherwise SetLabel skips unchanged text, so this is cheap.
+    if (!firmware_.busy() && fw_status_area_ != nullptr) {
+        SetLabel(lv_obj_get_child(Obj(fw_status_area_), 0), FirmwareOverview());
+    }
 }
 
 void MetaPanel::OpenAlert(const char* icon, const std::string& title, const std::string& body,
@@ -988,6 +1421,11 @@ void MetaPanel::OpenAlert(const char* icon, const std::string& title, const std:
     lv_obj_set_width(card, LV_PCT(92));
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_set_style_max_height(card, LV_PCT(92), 0);
+    // Scroll the whole card so the action buttons stay reachable even when the
+    // body text is tall (otherwise they get clipped below the card on 240px).
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_center(card);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(card, theme_->background_color(), 0);
@@ -1010,14 +1448,11 @@ void MetaPanel::OpenAlert(const char* icon, const std::string& title, const std:
     lv_obj_t* title_label = lv_label_create(header);
     lv_label_set_text(title_label, title.c_str());
 
-    // The body scrolls when it is longer than the screen.
+    // Body is a plain label container; the card itself scrolls (single scroll
+    // container avoids nested-scroll touch conflicts and keeps buttons reachable).
     lv_obj_t* body_area = Box(card);
-    lv_obj_add_flag(body_area,
-                    static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
     lv_obj_set_width(body_area, LV_PCT(100));
     lv_obj_set_height(body_area, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_height(body_area, 120, 0);
-    lv_obj_set_scroll_dir(body_area, LV_DIR_VER);
     AddLabel(body_area, body);
 
     alert_bar_ = Box(card);
@@ -1609,11 +2044,12 @@ void MetaPanel::CloseFileViewer() {
 struct MetaPanel::Button {};
 
 MetaPanel::MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
-                     MetaSettings& settings, Hooks hooks)
+                     MetaSettings& settings, FirmwareManager& firmware, Hooks hooks)
     : storage_(storage),
       music_(music),
       reminders_(reminders),
       settings_(settings),
+      firmware_(firmware),
       hooks_(std::move(hooks)) {}
 MetaPanel::~MetaPanel() = default;
 void MetaPanel::Toggle() {}
@@ -1623,6 +2059,8 @@ void MetaPanel::Refresh() {}
 void MetaPanel::ShowReminderAlert(const std::vector<Reminder>&) {}
 void MetaPanel::CloseAlert() {}
 void MetaPanel::ShowToast(const std::string&) {}
+void MetaPanel::BuildFirmware() {}
+void MetaPanel::RefreshFirmware() {}
 
 #endif  // METAOS_PANEL_ENABLED
 

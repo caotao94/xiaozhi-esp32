@@ -25,7 +25,11 @@ public:
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
-    void MarkCurrentVersionValid();
+    // Returns true when the running image is confirmed valid (or is factory, which
+    // is not rollback-managed); false if the state could not be read/marked.
+    bool MarkCurrentVersionValid();
+    // 将当前运行固件标记为无效并触发回滚重启。factory 分区或无可回滚槽位时跳过（不重启）。
+    void MarkCurrentVersionInvalid();
 
     const std::string& GetFirmwareVersion() const { return firmware_version_; }
     const std::string& GetCurrentVersion() const { return current_version_; }

@@ -13,6 +13,7 @@
 #include "display.h"
 #include "mcp_server.h"
 #include "metaos_common.h"
+#include "metaos_firmware.h"
 #include "metaos_motion.h"
 #include "metaos_music.h"
 #include "metaos_reminders.h"
@@ -53,8 +54,9 @@ MetaOs::MetaOs(SdmmcCard* card, Qmi8658* imu)
     reminders_ = std::make_unique<ReminderStore>(*storage_);
     music_ = std::make_unique<MusicPlayer>(*storage_);
     speech_ = std::make_unique<SpeechSynthesizer>(*storage_);
+    firmware_ = std::make_unique<FirmwareManager>(*storage_);
     panel_ = std::make_unique<MetaPanel>(
-        *storage_, *music_, *reminders_, settings_,
+        *storage_, *music_, *reminders_, settings_, *firmware_,
         MetaPanel::Hooks{
             .snooze = [this](const Reminder& reminder,
                              int minutes) { reminders_->Snooze(reminder, minutes); },
@@ -147,6 +149,10 @@ void MetaOs::Initialize() {
                        motion_settings);
     }
 
+    if (!firmware_->Start()) {
+        ESP_LOGE(TAG, "Firmware manager worker failed to start; firmware UI disabled");
+    }
+
     RegisterTools();
 
     esp_timer_create_args_t args = {};
@@ -190,6 +196,7 @@ void MetaOs::OnTick() {
     }
     FireReminders();
     music_->Tick();
+    firmware_->Poll();
     panel_->Refresh();
 }
 

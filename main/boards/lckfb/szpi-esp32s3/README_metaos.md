@@ -31,7 +31,7 @@ ESP32-S3 固件
 先激活 ESP-IDF（推荐 `release/v6.1`），然后：
 
 ```sh
-python scripts/build.py lckfb/szpi-esp32s3 --name lichuang-dev-metaos
+python scripts/build.py lckfb/szpi-esp32s3 --name lichuang-dev-metaos --language zh-CN
 ```
 
 `build.py` 会改写本地 `sdkconfig` 和 `build/`。变体在 `config.json` 中额外打开：
@@ -247,3 +247,102 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 - [ ] 翻转停止音乐/关闭弹窗
 - [ ] 设置页面：音量、亮度、TF 卡重检测、手势开关
 - [ ] IMU MCP 工具：`self.motion.get_state` 返回正确的加速度和状态
+
+## Factory 救援变体（lichuang-dev-rescue）
+
+独立的最小救援固件，编译开关 `CONFIG_METAOS_RESCUE_MODE=y`。不依赖 Application/音频/蓝牙/MCP/云，
+用于在主固件损坏时从 TF 卡恢复。
+
+- **构建**：`python scripts/build.py lckfb/szpi-esp32s3 --name lichuang-dev-rescue`
+- **身份**：BOARD_NAME=`lichuang-dev-rescue`（独立 OTA 身份），BOARD_TYPE=`lichuang-dev`
+- **分区表**：`partitions/v2/16m_metaos.csv`（factory@0x20000 + ota_0@0x420000 + ota_1@0x820000 + assets@0xc20000 + coredump@0xfe0000）
+- **功能**：LCD+触摸+SD 状态页、TF 卡固件仓库扫描（`/sdcard/metaos/firmware/<channel>/manifest.json`）、
+  SHA-256 校验、经 OTA API 安装到 ota_0/ota_1（禁止 factory 与运行中分区）、启动槽切换。
+- **UI 语言**：中文。内嵌专用子集字体 `font_rescue_20_4`（20px/4bpp，仅含救援 UI 用到的约 102 个汉字 + ASCII，源自 OFL 许可的 Noto Sans SC）。分区标签 ota_0/ota_1/factory、SHA-256/FAT32、OTA 状态名及底层错误诊断保留英文。改 UI 文案后运行 `python scripts/gen_rescue_font.py` 重新生成 `main/rescue/rescue_font.c`（需 fontTools + node/npx）。
+- **签名**：当前仅 SHA-256 完整性校验，发布者签名验证为 Phase 4，UI 如实标注"未验证"。
+- **线程模型**：单一常驻工作任务负责所有 SD 挂载/扫描/安装（SdmmcCard 要求 Mount 固定在同一任务）；
+  LVGL 操作均在 LVGL 任务内或持 `lvgl_port_lock`；进度经原子变量 + LVGL 定时器传递。
+
+### 分区迁移前提（重要）
+
+新分区表的 factory@0x20000 与旧表 ota_0@0x20000 重叠，**不能通过 OTA 迁移**。
+必须串口整表烧录（bootloader + 分区表 + otadata + factory + ota_0 + assets），
+保留 0x9000-0xCFFF 的 NVS 区即可保住 WiFi 配置。详见 `METAOS_PHASE1_CHANGE_PLAN.md` §4。
+两个 OTA 槽都失效时，bootloader 自动回落到 factory 救援系统。
+
+## 多固件变体与 SD 仓库打包
+
+### 构建变体（config.json 的 builds）
+
+| 变体 | 用途 | 关键配置 |
+|---|---|---|
+| `lichuang-dev` | 原版小智 | — |
+| `lichuang-dev-metaos` | MetaOS 主固件（默认样式） | METAOS_ENABLE、分区表 16m_metaos.csv |
+| `lichuang-dev-metaos-wechat` | MetaOS + 微信样式 | 额外 USE_WECHAT_MESSAGE_STYLE |
+| `lichuang-dev-rescue` | Factory 救援（中文 UI） | METAOS_RESCUE_MODE，无音频/蓝牙/assets |
+
+构建命令（`--language` 由 build.py 控制，会覆盖 config.json；MetaOS 系列用 zh-CN）：
+
+```
+python scripts/build.py lckfb/szpi-esp32s3 --name <变体名> --language zh-CN
+```
+
+**单 build 目录警告**：build.py 复用同一个 `build/`，切换变体会覆盖 `build/xiaozhi.bin`。
+要保留多个变体的产物，编完一个立刻另存（如 `cp build/xiaozhi.bin xxx.bin`）再编下一个。
+
+### 显示样式与 MetaOS 触摸界面的兼容性
+
+- **默认 / 微信样式**：走 SpiLcdDisplay（LVGL + 主题），MetaOS 面板正常，固件管理界面可用。
+- **表情动画（emote）**：走 EmoteDisplay，其 `SetTheme()` 是空实现 → 不建立 LVGL 主题 →
+  MetaPanel 依赖 `CurrentTheme()` 渲染，拿不到主题就不显示。**这是结构限制，不是配置问题**：
+  emote 样式做不出触摸版固件管理界面（MetaOS 语音工具仍可用）。因此未提供 emote 的 MetaOS 变体。
+
+### 救援固件的中文子集字体
+
+救援 UI 用内嵌子集字体 `font_rescue_20_4`（仅含 UI 用到的约 102 个汉字 + ASCII，源自 OFL 的 Noto Sans SC）。
+**改过 rescue_ui.cc 的文案后必须重新生成字体**，否则新汉字缺字形：
+
+```
+python scripts/gen_rescue_font.py     # 需 fontTools + node/npx（lv_font_conv@1.5.3）
+```
+
+脚本从 rescue_ui.cc 的字符串字面量提取非 ASCII 码点，实例化 NotoSansSC 静态字体后生成
+`main/rescue/rescue_font.c`。
+
+### SD 固件仓库打包
+
+仓库路径 `/sdcard/metaos/firmware/<名>/manifest.json` + `<bin>`（签名版加 `manifest.json.sig`）。
+生成工具 `scripts/firmware_package.py`：
+
+```
+# 生成密钥（私钥放仓库外！公钥写进 main/firmware/firmware_pubkey.h）
+python scripts/firmware_package.py genkey --out <私密目录> --pubkey-header main/firmware/firmware_pubkey.h
+
+# 打包（只打包 APP 镜像，不要 merged.bin）
+python scripts/firmware_package.py package --bin build/xiaozhi.bin \
+    --name "默认" --firmware-id xiaozhi-default-metaos --bin-name default.bin \
+    --target-board lichuang-dev --channel stable --out "F:/metaos/firmware/default"
+
+# 自验（签名 + bin 哈希）
+python scripts/firmware_package.py verify --dir F:/metaos/firmware/default --key <私钥>
+```
+
+要点：
+- **只打包 app 镜像**（`xiaozhi.bin` / `*.ino.bin`）。merged.bin 的 0x0 是 bootloader、app 在 0x10000，
+  塞进 OTA 槽会校验失败；merged 只用于整片烧录。
+- `--target-board` 填板型 `lichuang-dev`（安装时与 BOARD_TYPE/BOARD_NAME 比对）。
+- 无签名包默认允许安装（`CONFIG_METAOS_FW_REQUIRE_SIGNATURE=n`）；**有签名但验签失败一律拒绝**。
+- manifest 的 `signature` 字段只在 `--key` 时写入；无签名字段为空，设备据此区分"未签名/已签名"。
+
+### 切换与安装的可靠方式
+
+- 设备端：MetaOS 或救援的 固件管理 → 启动切换 / 安装（走 `esp_ota_set_boot_partition`，正确维护 otadata）。
+- PC 端：优先救援界面或 otatool；**不要手写 otadata 二进制**——entry 的 seq/crc/残留状态容易冲突，
+  曾导致 bootloader 选择异常反复回落。otadata 全空白（0xFF）时会启动 factory 救援，可作兜底入口。
+
+### 跨项目固件共存的经验（HID 桥接实验）
+
+- 第三方固件（如 Arduino HID）能否装进 OTA 槽，取决于它**实际需要的分区**是否在共享分区表里。
+  HID 固件只用 NVS + coredump，MetaOS 表里都有 → 可以共存；它自带分区表/ bootloader 的 merged 镜像则不行。
+- Arduino 固件 `CDCOnBoot=cdc` 会把控制台转到 USB，UART 串口全静默，排查时改用 `CDCOnBoot=default`。
+- 第三方固件不自确认 OTA 时，切过去会被 PENDING_VERIFY 回滚；HID 固件自带 ota_confirm 则不会。

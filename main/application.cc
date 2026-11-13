@@ -58,6 +58,10 @@ Application::~Application() {
         esp_timer_stop(startup_wake_word_hint_timer_);
         esp_timer_delete(startup_wake_word_hint_timer_);
     }
+    if (firmware_health_timer_ != nullptr) {
+        esp_timer_stop(firmware_health_timer_);
+        esp_timer_delete(firmware_health_timer_);
+    }
     vEventGroupDelete(event_group_);
 }
 
@@ -181,6 +185,26 @@ void Application::Initialize() {
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
+
+    // 启动本地健康确认定时器：约 45 秒后在主任务里确认固件健康。
+    // 放在 Initialize 末尾（而非激活完成后），使确认完全独立于云端/网络：
+    // 即使设备一直联不上云，只要本地子系统正常，固件也会被标记为有效，避免被 bootloader 回滚。
+    if (firmware_health_timer_ == nullptr) {
+        esp_timer_create_args_t health_timer_args = {
+            .callback =
+                [](void* arg) {
+                    auto app = static_cast<Application*>(arg);
+                    // 定时器回调运行在 esp_timer 任务，重活调度回主任务执行。
+                    app->Schedule([app]() { app->ConfirmFirmwareHealth(); });
+                },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "fw_health",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&health_timer_args, &firmware_health_timer_));
+    }
+    ESP_ERROR_CHECK(esp_timer_start_once(firmware_health_timer_, 45 * 1000 * 1000));
 }
 
 void Application::Run() {
@@ -550,6 +574,74 @@ void Application::CheckNewVersion() {
                 break;
             }
         }
+    }
+}
+
+void Application::ConfirmFirmwareHealth() {
+    // 升级过程中不确认：此时新镜像可能已写入并切换了启动槽位，若此刻标记"当前有效"，
+    // 可能把尚未启动验证的新镜像误标为有效，破坏其回滚保护。升级成功会直接重启，
+    // 失败会回到正常流程，因此稍后重试即可（升级自身的 HTTP 流程有超时，不会无限等待）。
+    if (GetDeviceState() == kDeviceStateUpgrading) {
+        // Bound the deferral so a stuck Upgrading state (e.g. a failed MCP upgrade
+        // that never returns to Idle) cannot starve health confirmation forever.
+        if (firmware_health_retries_ < 12) {
+            firmware_health_retries_++;
+            ESP_LOGI(TAG, "Firmware health check deferred: upgrade in progress");
+            esp_timer_start_once(firmware_health_timer_, 30 * 1000 * 1000);
+            return;
+        }
+        ESP_LOGW(TAG, "Upgrade still busy after deferrals; proceeding with health check");
+    }
+
+    auto& board = Board::GetInstance();
+
+    // 1) 显示已初始化。无显示板卡由 Board 提供 NoDisplay 兜底，这里做防御性检查。
+    auto display = board.GetDisplay();
+    // 2) 音频 codec 已初始化（AudioService::Initialize 内部会调用 codec->Start()）。
+    auto codec = board.GetAudioCodec();
+    // 3) 关键音频任务存活。这些任务在 AudioService::Start() 中创建，存活即说明音频管线
+    //    已经运行。按任务名查询句柄：一次性、低频，不在音频热路径上，开销可忽略。
+    const bool audio_tasks_alive = xTaskGetHandle("audio_input") != nullptr &&
+                                   xTaskGetHandle("audio_output") != nullptr &&
+                                   xTaskGetHandle("opus_codec") != nullptr;
+    // 4) SD 卡是板级可选能力，核心层不持有 SD 接口。无卡时 MetaOS 已显式降级
+    //    （日志 "Running without an SD card"，存储类功能如实报告无卡），属于受支持的
+    //    运行模式，因此"SD 挂载或明确无卡降级"两种情况都不构成启动失败，确认不以其为前提。
+
+    const bool healthy = display != nullptr && codec != nullptr && audio_tasks_alive;
+    if (!healthy) {
+        ESP_LOGE(TAG, "Firmware health check failed (display=%d codec=%d audio_tasks=%d)",
+                 display != nullptr, codec != nullptr, audio_tasks_alive);
+        // 有限次重试，覆盖升级失败后音频服务重启等短暂窗口；仍失败则不确认，
+        // 交由 bootloader 回滚与启动失败计数兜底。
+        if (firmware_health_retries_ < 3) {
+            firmware_health_retries_++;
+            esp_timer_start_once(firmware_health_timer_, 15 * 1000 * 1000);
+        } else {
+            ESP_LOGE(TAG,
+                     "Firmware left unconfirmed after retries; rollback protection stays armed");
+        }
+        return;
+    }
+
+    // 本地健康通过：独立于云端 CheckNewVersion 确认当前固件有效（factory 分区内部会跳过）。
+    // 激活完成后 ota_ 已被释放，这里按需构造临时 Ota（其构造仅读取 eFuse，开销很小）。
+    bool marked;
+    if (ota_) {
+        marked = ota_->MarkCurrentVersionValid();
+    } else {
+        Ota ota;
+        marked = ota.MarkCurrentVersionValid();
+    }
+
+    if (marked) {
+        // 清零启动失败计数（新增 NVS 键，命名空间 "boot"，不影响既有键）。
+        Settings boot_settings("boot", true);
+        boot_settings.SetInt("boot_fail", 0);
+        ESP_LOGI(TAG, "Firmware health confirmed, rollback cancelled");
+    } else {
+        // 标记失败时保留计数，不能谎报"回滚已取消"。
+        ESP_LOGE(TAG, "Health OK but marking valid failed; boot_fail retained");
     }
 }
 

@@ -257,23 +257,44 @@ NetworkResult<> Ota::CheckVersion() {
     return {};
 }
 
-void Ota::MarkCurrentVersionValid() {
+bool Ota::MarkCurrentVersionValid() {
     auto partition = esp_ota_get_running_partition();
     if (strcmp(partition->label, "factory") == 0) {
         ESP_LOGI(TAG, "Running from factory partition, skipping");
-        return;
+        return true;
     }
 
     ESP_LOGI(TAG, "Running partition: %s", partition->label);
     esp_ota_img_states_t state;
     if (esp_ota_get_state_partition(partition, &state) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get state of partition");
-        return;
+        return false;
     }
 
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGI(TAG, "Marking firmware as valid");
-        esp_ota_mark_app_valid_cancel_rollback();
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to mark valid: %s", esp_err_to_name(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+void Ota::MarkCurrentVersionInvalid() {
+    auto partition = esp_ota_get_running_partition();
+    if (strcmp(partition->label, "factory") == 0) {
+        ESP_LOGI(TAG, "Running from factory partition, skipping rollback");
+        return;
+    }
+
+    ESP_LOGW(TAG, "Marking firmware on %s as invalid, rolling back", partition->label);
+    // 成功时该调用直接重启、不会返回；factory 已在上面跳过。
+    // 若没有可回滚的槽位（例如另一槽为空或损坏），返回错误并继续运行当前固件。
+    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Rollback failed: %s", esp_err_to_name(err));
     }
 }
 

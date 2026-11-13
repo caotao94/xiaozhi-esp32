@@ -153,6 +153,9 @@ private:
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     esp_timer_handle_t startup_wake_word_hint_timer_ = nullptr;
+    // 启动健康确认一次性定时器（独立于云端版本检查）。
+    esp_timer_handle_t firmware_health_timer_ = nullptr;
+    int firmware_health_retries_ = 0;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -204,6 +207,9 @@ private:
     // Helper methods
     void CheckAssetsVersion();
     void CheckNewVersion();
+    // 本地启动健康确认（不依赖云端）：检查显示/音频/关键任务，通过后把当前固件标记为有效
+    // 并清零 NVS 启动失败计数。由 firmware_health_timer_ 在主任务中调度执行。
+    void ConfirmFirmwareHealth();
     void InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);

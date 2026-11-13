@@ -1,5 +1,9 @@
 # XiaoZhi ESP32 开发环境配置
 
+项目规则和架构说明见 AGENTS.md，在这里导入，确保它和本文件一起加载：
+
+@AGENTS.md
+
 ## ESP-IDF 环境激活
 
 在 PowerShell 中运行以下命令激活开发环境：
@@ -108,3 +112,18 @@ $env:IDF_TOOLS_PATH = "C:\Espressif\tools"
 ```powershell
 C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe E:\esp\v6.1\esp-idf\tools\idf.py -p COM7 flash monitor
 ```
+
+### 从 Git Bash / Claude Code 调用构建（重要）
+
+Git Bash 的 `MSYSTEM=MINGW64` 环境变量会泄漏进 PowerShell，触发 idf.py 的 MSYS 检测导致构建不执行。
+自动化构建脚本必须先清除再激活 profile：
+
+```powershell
+Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
+Remove-Item Env:MSYS -ErrorAction SilentlyContinue
+. "C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1"
+Set-Location "E:\xiaozhi\xiaozhi-esp32"
+idf.py build
+```
+
+交互式 PowerShell 窗口不受影响（没有 MSYSTEM）。

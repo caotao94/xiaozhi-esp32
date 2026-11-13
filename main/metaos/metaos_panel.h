@@ -15,6 +15,7 @@ namespace metaos {
 class MusicPlayer;
 class Storage;
 class FileBrowser;
+class FirmwareManager;
 
 // User settings shown on the settings page. They live in NVS ("metaos" namespace).
 struct MetaSettings {
@@ -34,7 +35,7 @@ struct MetaSettings {
 // Without LVGL (OLED, e-paper, emote display) every method is a no-op.
 class MetaPanel {
 public:
-    enum class Page { kHome, kMusic, kReminders, kFiles, kSettings, kImage, kText };
+    enum class Page { kHome, kMusic, kReminders, kFiles, kSettings, kImage, kText, kFirmware };
 
     struct Hooks {
         // Main task. Actions that belong to MetaOs.
@@ -46,7 +47,7 @@ public:
     struct Button;
 
     MetaPanel(Storage& storage, MusicPlayer& music, ReminderStore& reminders,
-              MetaSettings& settings, Hooks hooks);
+              MetaSettings& settings, FirmwareManager& firmware, Hooks hooks);
     ~MetaPanel();
 
     MetaPanel(const MetaPanel&) = delete;
@@ -96,8 +97,10 @@ private:
     void BuildReminders();
     void BuildFiles();
     void BuildSettings();
+    void BuildFirmware();
     void RefreshLocked();
     void RefreshHome();
+    void RefreshFirmware();
 
     // File viewer/editor sub-pages
     void ShowImageViewer(const std::string& path);
@@ -113,9 +116,18 @@ private:
     Storage& storage_;
     MusicPlayer& music_;
     ReminderStore& reminders_;
-    FileBrowser* file_browser_;
+    FileBrowser* file_browser_ = nullptr;
     MetaSettings& settings_;
+    FirmwareManager& firmware_;
     Hooks hooks_;
+
+    // Firmware page state (main task only).
+    void* fw_status_area_ = nullptr;
+    void* fw_list_area_ = nullptr;
+    void* fw_progress_bar_ = nullptr;
+    void* fw_progress_label_ = nullptr;
+    void* fw_cancel_button_ = nullptr;
+    int fw_selected_index_ = -1;
 
     LvglTheme* theme_ = nullptr;
     // Touch callbacks referenced by LVGL event user data. Freed after their widgets.

@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <vector>
+#include <new>
 
 #include "jpeg_to_image.h"
 
@@ -129,8 +129,8 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
 
     // Read IHDR chunk
     PngChunk chunk;
-    if (!ReadPngChunk(f, chunk) || chunk.type != 0x49484452) {  // 'IHDR'
-        ESP_LOGE(TAG, "PNG: missing IHDR");
+    if (!ReadPngChunk(f, chunk) || chunk.type != 0x49484452 || chunk.length != 13) {  // 'IHDR'
+        ESP_LOGE(TAG, "PNG: missing or bad IHDR");
         error = ImageError::kCorrupt;
         return nullptr;
     }
@@ -140,7 +140,10 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
         error = ImageError::kCorrupt;
         return nullptr;
     }
-    fseek(f, 4, SEEK_CUR);  // Skip CRC
+    if (fseek(f, 4, SEEK_CUR) != 0) {  // Skip CRC
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
 
     uint32_t width = (ihdr[0] << 24) | (ihdr[1] << 16) | (ihdr[2] << 8) | ihdr[3];
     uint32_t height = (ihdr[4] << 24) | (ihdr[5] << 16) | (ihdr[6] << 8) | ihdr[7];
@@ -157,41 +160,120 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
         return nullptr;
     }
 
+    if (width == 0 || height == 0) {
+        ESP_LOGW(TAG, "PNG: zero dimension");
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
+
     if (width > 4096 || height > 4096) {
         ESP_LOGW(TAG, "PNG too large: %lux%lu", width, height);
         error = ImageError::kTooLarge;
         return nullptr;
     }
 
-    // Collect IDAT chunks
-    std::vector<uint8_t> compressed;
-    compressed.reserve(64 * 1024);
+    // Supported: grayscale(0), RGB(2), grayscale+alpha(4), RGBA(6) at 8/16-bit.
+    // Palette(3) would need PLTE parsing; sub-byte depths would need unpacking.
+    if ((color_type != 0 && color_type != 2 && color_type != 4 && color_type != 6) ||
+        (bit_depth != 8 && bit_depth != 16)) {
+        ESP_LOGW(TAG, "PNG: unsupported color/depth: %u/%u", color_type, bit_depth);
+        error = ImageError::kUnsupported;
+        return nullptr;
+    }
 
+    // Collect IDAT chunks in two passes: sum their sizes, then read into one
+    // PSRAM allocation. The previous std::vector grew via operator new, which
+    // abort()s on allocation failure because C++ exceptions are disabled; a
+    // 1024x1024 PNG crashed the device this way. heap_caps_malloc lets us
+    // return kNoMemory instead. The 8MB cap rejects huge PNGs whose raw data
+    // could never fit the 8MB PSRAM anyway; they fail fast with kTooLarge.
+    constexpr size_t kMaxCompressedBytes = 8 * 1024 * 1024;
+    long idat_start = ftell(f);
+    if (idat_start < 0) {
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
+
+    size_t compressed_size = 0;
     while (ReadPngChunk(f, chunk)) {
         if (chunk.type == 0x49454E44) {  // 'IEND'
             break;
         }
+        if (chunk.length > kMaxCompressedBytes) {
+            ESP_LOGW(TAG, "PNG: chunk too large: %lu", chunk.length);
+            error = ImageError::kTooLarge;
+            return nullptr;
+        }
         if (chunk.type == 0x49444154) {  // 'IDAT'
-            size_t start = compressed.size();
-            compressed.resize(start + chunk.length);
-            if (ReadChunk(f, compressed.data() + start, chunk.length) != chunk.length) {
-                error = ImageError::kCorrupt;
+            if (chunk.length > kMaxCompressedBytes - compressed_size) {
+                ESP_LOGW(TAG, "PNG: IDAT total exceeds %zu bytes", kMaxCompressedBytes);
+                error = ImageError::kTooLarge;
                 return nullptr;
             }
-            fseek(f, 4, SEEK_CUR);  // Skip CRC
-        } else {
-            fseek(f, chunk.length + 4, SEEK_CUR);  // Skip data + CRC
+            compressed_size += chunk.length;
+        }
+        if (fseek(f, chunk.length + 4, SEEK_CUR) != 0) {  // Skip data + CRC
+            break;
         }
     }
 
-    if (compressed.empty()) {
+    if (compressed_size == 0) {
         ESP_LOGE(TAG, "PNG: no IDAT chunks");
         error = ImageError::kCorrupt;
         return nullptr;
     }
 
-    // Decompress with miniz
-    size_t bytes_per_pixel = (color_type == 2) ? 3 : (color_type == 6) ? 4 : 1;
+    uint8_t* compressed =
+        static_cast<uint8_t*>(heap_caps_malloc(compressed_size, MALLOC_CAP_SPIRAM));
+    if (compressed == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate %zu bytes for PNG IDAT", compressed_size);
+        error = ImageError::kNoMemory;
+        return nullptr;
+    }
+
+    if (fseek(f, idat_start, SEEK_SET) != 0) {
+        heap_caps_free(compressed);
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
+    size_t filled = 0;
+    while (filled < compressed_size && ReadPngChunk(f, chunk)) {
+        if (chunk.type == 0x49454E44) {  // 'IEND'
+            break;
+        }
+        // Re-apply the cap: the file could have changed between passes (SD card).
+        if (chunk.length > kMaxCompressedBytes) {
+            heap_caps_free(compressed);
+            error = ImageError::kTooLarge;
+            return nullptr;
+        }
+        if (chunk.type == 0x49444154) {  // 'IDAT'
+            if (chunk.length > compressed_size - filled ||
+                ReadChunk(f, compressed + filled, chunk.length) != chunk.length) {
+                heap_caps_free(compressed);
+                error = ImageError::kCorrupt;
+                return nullptr;
+            }
+            filled += chunk.length;
+            if (fseek(f, 4, SEEK_CUR) != 0) {  // Skip CRC
+                break;
+            }
+        } else if (fseek(f, chunk.length + 4, SEEK_CUR) != 0) {  // Skip data + CRC
+            break;
+        }
+    }
+    if (filled != compressed_size) {
+        heap_caps_free(compressed);
+        error = ImageError::kCorrupt;
+        return nullptr;
+    }
+
+    // Decompress with the ROM tinfl. Grayscale+alpha(4) is 2 bytes/pixel; getting
+    // this wrong halves raw_size and makes the inflate loop stall.
+    size_t bytes_per_pixel = (color_type == 2)   ? 3
+                             : (color_type == 6) ? 4
+                             : (color_type == 4) ? 2
+                                                 : 1;
     if (bit_depth == 16) {
         bytes_per_pixel *= 2;
     }
@@ -201,6 +283,7 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
     uint8_t* raw = static_cast<uint8_t*>(heap_caps_malloc(raw_size, MALLOC_CAP_SPIRAM));
     if (raw == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate %zu bytes for PNG raw", raw_size);
+        heap_caps_free(compressed);
         error = ImageError::kNoMemory;
         return nullptr;
     }
@@ -212,34 +295,66 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
     int status = TINFL_STATUS_NEEDS_MORE_INPUT;
 
     while (status == TINFL_STATUS_NEEDS_MORE_INPUT || status == TINFL_STATUS_HAS_MORE_OUTPUT) {
-        size_t in_avail = compressed.size() - in_pos;
+        size_t in_avail = compressed_size - in_pos;
         size_t out_avail = raw_size - out_pos;
         size_t in_consumed = in_avail;
         size_t out_written = out_avail;
 
-        status = tinfl_decompress(
-            &inflator, compressed.data() + in_pos, &in_consumed, raw, raw + out_pos, &out_written,
-            TINFL_FLAG_HAS_MORE_INPUT | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+        // IDAT is a zlib stream (RFC 1950): PARSE_ZLIB_HEADER is required, else
+        // tinfl expects raw deflate and misparses the zlib header. Only promise
+        // more input while some remains; promising it at EOF makes tinfl wait
+        // forever on a truncated stream.
+        uint32_t flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+        if (in_pos < compressed_size) {
+            flags |= TINFL_FLAG_HAS_MORE_INPUT;
+        }
+
+        status = tinfl_decompress(&inflator, compressed + in_pos, &in_consumed, raw, raw + out_pos,
+                                  &out_written, flags);
 
         in_pos += in_consumed;
         out_pos += out_written;
 
         if (status < 0) {
             ESP_LOGE(TAG, "PNG: inflate failed: %d", status);
+            heap_caps_free(compressed);
+            heap_caps_free(raw);
+            error = ImageError::kCorrupt;
+            return nullptr;
+        }
+        // Zero progress with a non-final status means truncated input or an
+        // output buffer too small for the stream; bail out instead of spinning.
+        if (in_consumed == 0 && out_written == 0) {
+            ESP_LOGE(TAG, "PNG: inflate stalled at %zu/%zu", out_pos, raw_size);
+            heap_caps_free(compressed);
             heap_caps_free(raw);
             error = ImageError::kCorrupt;
             return nullptr;
         }
     }
 
+    // Compressed data is no longer needed; free it before the RGB565 allocation
+    // to lower peak PSRAM usage.
+    heap_caps_free(compressed);
+
     if (out_pos < raw_size) {
-        ESP_LOGW(TAG, "PNG: incomplete inflate: %zu/%zu", out_pos, raw_size);
+        // Continuing would unfilter and convert uninitialized PSRAM rows.
+        ESP_LOGE(TAG, "PNG: incomplete inflate: %zu/%zu", out_pos, raw_size);
+        heap_caps_free(raw);
+        error = ImageError::kCorrupt;
+        return nullptr;
     }
 
     // Unfilter scanlines
     for (uint32_t y = 0; y < height && y * stride < out_pos; y++) {
         uint8_t* line = raw + y * stride;
         uint8_t filter = line[0];
+        if (filter > 4) {
+            ESP_LOGE(TAG, "PNG: bad filter %u at row %lu", filter, y);
+            heap_caps_free(raw);
+            error = ImageError::kCorrupt;
+            return nullptr;
+        }
         uint8_t* prev = (y > 0) ? (line - stride + 1) : nullptr;
 
         for (size_t x = 1; x < stride; x++) {
@@ -289,6 +404,8 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
             uint8_t r = 0, g = 0, b = 0;
             if (color_type == 0) {  // Grayscale
                 r = g = b = pixel[0];
+            } else if (color_type == 4) {  // Grayscale + alpha (alpha ignored)
+                r = g = b = pixel[0];
             } else if (color_type == 2) {  // RGB
                 r = pixel[0];
                 g = pixel[1];
@@ -307,7 +424,13 @@ std::unique_ptr<DecodedImage> DecodePng(FILE* f, int max_width, int max_height, 
 
     heap_caps_free(raw);
 
-    auto image = std::make_unique<DecodedImage>();
+    // nothrow: exceptions are disabled, a throwing new would abort() on OOM.
+    auto image = std::unique_ptr<DecodedImage>(new (std::nothrow) DecodedImage());
+    if (image == nullptr) {
+        heap_caps_free(rgb565);
+        error = ImageError::kNoMemory;
+        return nullptr;
+    }
     image->kind = DecodedImage::Kind::kBitmap;
     image->width = out_width;
     image->height = out_height;

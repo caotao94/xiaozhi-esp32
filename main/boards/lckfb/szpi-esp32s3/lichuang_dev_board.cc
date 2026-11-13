@@ -1,3 +1,6 @@
+#include "sdkconfig.h"
+
+#if !CONFIG_METAOS_RESCUE_MODE
 #include "application.h"
 #include "button.h"
 #include "codecs/box_audio_codec.h"
@@ -345,3 +348,4 @@ public:
 };
 
 DECLARE_BOARD(LichuangDevBoard);
+#endif  // !CONFIG_METAOS_RESCUE_MODE
