@@ -111,6 +111,9 @@ if(CONFIG_METAOS_ENABLE)
     )
     list(APPEND INCLUDE_DIRS "metaos" "firmware")
 endif()
+if(CONFIG_METAOS_USB_MSC)
+    list(APPEND SOURCES "boards/common/usb_msc.cc")
+endif()
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
 
@@ -1240,6 +1243,11 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD OR CONFIG_METAOS_ENABLE)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         esp_driver_sdmmc
         sdmmc
+    )
+endif()
+if(CONFIG_METAOS_USB_MSC)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        espressif__esp_tinyusb
     )
 endif()
 if(CONFIG_METAOS_RESCUE_MODE)

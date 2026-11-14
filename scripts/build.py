@@ -1283,6 +1283,12 @@ _AUTO_SELECT_RULES: dict[str, list[str]] = {
         "CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n",
         "CONFIG_BT_BLE_BLUFI_ENABLE=y",
     ],
+    # USB MSC needs the TinyUSB MSC class compiled in, and async IO so that switching the
+    # card back to the app drains deferred host writes before FAT is remounted.
+    "CONFIG_METAOS_USB_MSC": [
+        "CONFIG_TINYUSB_MSC_ENABLED=y",
+        "CONFIG_TINYUSB_MSC_ASYNC_IO=y",
+    ],
 }
 
 # sdkconfig.defaults.esp32s3 keeps a 1MB LVGL TLSF pool for PSRAM. Without

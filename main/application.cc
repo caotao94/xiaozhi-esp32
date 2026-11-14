@@ -1328,6 +1328,8 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     }
 }
 
+bool Application::IsLocalPlaybackBusy() const { return notify_player_.IsBusy(); }
+
 bool Application::CanStartLocalPlayback() const {
     return state_machine_.GetState() == kDeviceStateIdle && !notify_player_.IsBusy() &&
            (!protocol_ || !protocol_->IsAudioChannelOpened());

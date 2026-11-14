@@ -19,9 +19,11 @@
 #include "metaos_reminders.h"
 #include "metaos_speech.h"
 #include "metaos_strings.h"
+#include "metaos_worker.h"
 #include "qmi8658.h"
 #include "sd_card.h"
 #include "settings.h"
+#include "usb_msc.h"
 
 #define TAG "MetaOS"
 
@@ -50,7 +52,12 @@ bool HasLvglScreen() {
 }  // namespace
 
 MetaOs::MetaOs(SdmmcCard* card, Qmi8658* imu)
-    : storage_(std::make_unique<Storage>(card)), imu_(imu) {
+    : storage_(std::make_unique<Storage>(card)), imu_(imu), card_(card) {
+#if CONFIG_METAOS_USB_MSC
+    if (card_ != nullptr && card_->usb_msc()) {
+        usb_msc_ = std::make_unique<UsbMsc>(card_);
+    }
+#endif
     reminders_ = std::make_unique<ReminderStore>(*storage_);
     music_ = std::make_unique<MusicPlayer>(*storage_);
     speech_ = std::make_unique<SpeechSynthesizer>(*storage_);
@@ -62,6 +69,9 @@ MetaOs::MetaOs(SdmmcCard* card, Qmi8658* imu)
                              int minutes) { reminders_->Snooze(reminder, minutes); },
             .settings_changed = [this]() { SaveSettings(); },
             .retry_card = [this]() { RetryCard(); },
+            .usb_msc_available = [this]() { return usb_msc_available(); },
+            .usb_msc_active = [this]() { return usb_msc_active(); },
+            .usb_msc_set = [this](bool on) { RequestUsbMode(on); },
         });
     if (imu_ != nullptr) {
         motion_ = std::make_unique<MotionDetector>(imu_);
@@ -103,6 +113,13 @@ void MetaOs::SaveSettings() {
 
 void MetaOs::Initialize() {
     LoadSettings();
+#if CONFIG_METAOS_USB_MSC
+    // Start USB MSC first: it initializes the bare card and mounts FAT for the app, so the
+    // storage_->Ensure() below sees a mounted card. If it fails, SD access is unavailable.
+    if (usb_msc_ != nullptr && !usb_msc_->Start()) {
+        ESP_LOGE(TAG, "USB MSC failed to start; TF card access unavailable");
+    }
+#endif
     // Mount early so the first tool call does not pay for card initialization.
     if (storage_->Ensure()) {
         reminders_->Load();
@@ -129,20 +146,34 @@ void MetaOs::Initialize() {
         motion_settings.shake_enabled = settings_.shake_next;
         motion_settings.flip_enabled = settings_.flip_stop;
         motion_->Start(MotionDetector::Callbacks{
-                           .on_shake =
+                           .on_shake_next =
                                [this]() {
                                    if (music_->IsPlaying()) {
                                        music_->SkipNext();
                                        panel_->ShowToast("已切歌");
                                    }
                                },
-                           .on_flip_over =
+                           .on_shake_prev =
                                [this]() {
                                    if (music_->IsPlaying()) {
+                                       music_->SkipPrevious();
+                                       panel_->ShowToast("上一首");
+                                   }
+                               },
+                           .on_flip_over =
+                               [this]() {
+                                   // Include queued (pending) music: StopPlayback clears the
+                                   // pending start too, so a flip cancels a track that has not
+                                   // begun playing yet.
+                                   if (music_->IsPlaying() || music_->IsPending()) {
                                        music_->StopPlayback();
                                        panel_->ShowToast("已停止");
                                    } else if (panel_->IsAlertOpen()) {
                                        panel_->CloseAlert();
+                                       // A spoken reminder plays through the local notification
+                                       // path; closing the dialog alone would leave it speaking.
+                                       Application::GetInstance().StopLocalPlayback();
+                                       panel_->ShowToast("已停止");
                                    }
                                },
                        },
@@ -194,19 +225,136 @@ void MetaOs::OnTick() {
         reminders_->Load();
         storage_loaded_ = true;
     }
-    FireReminders();
-    music_->Tick();
+#if CONFIG_METAOS_USB_MSC
+    const bool usb_busy = usb_state_ != UsbState::kOff;
+#else
+    const bool usb_busy = false;
+#endif
+    // While entering/holding USB mode, do not fire reminders (which would consume and try to
+    // persist them) or start queued music against a card the firmware no longer owns.
+    if (!usb_busy) {
+        FireReminders();
+        music_->Tick();
+    }
     firmware_->Poll();
+    TickUsb();
     panel_->Refresh();
 }
 
 void MetaOs::RetryCard() {
+#if CONFIG_METAOS_USB_MSC
+    // Recovery path: if the card is not mounted (e.g. a failed USB-exit remount after the PC
+    // reformatted it), re-initialize the bare card and remount FAT instead of short-circuiting
+    // on the stale card_inited_ flag.
+    if (usb_msc_ != nullptr && usb_state_ == UsbState::kOff && !storage_->IsMounted()) {
+        usb_msc_->Restart();
+    }
+#endif
     if (storage_->Ensure(true)) {
         if (!storage_loaded_) {
             reminders_->Load();
             storage_loaded_ = true;
         }
     }
+}
+
+bool MetaOs::usb_msc_available() const {
+#if CONFIG_METAOS_USB_MSC
+    return usb_msc_ != nullptr && usb_msc_->started();
+#else
+    return false;
+#endif
+}
+
+bool MetaOs::usb_msc_active() const {
+#if CONFIG_METAOS_USB_MSC
+    return usb_state_ != UsbState::kOff;
+#else
+    return false;
+#endif
+}
+
+void MetaOs::RequestUsbMode(bool on) {
+#if CONFIG_METAOS_USB_MSC
+    if (usb_msc_ == nullptr || !usb_msc_->started()) {
+        return;
+    }
+    if (on) {
+        if (usb_state_ != UsbState::kOff) {
+            return;
+        }
+        // Quiesce every file user, then hand the card to USB once they are idle (TickUsb).
+        // Blocking new worker jobs prevents a fresh file op from racing the FAT unmount.
+        music_->StopPlayback();
+        Application::GetInstance().StopLocalPlayback();
+        firmware_->Cancel();
+        SetWorkEnabled(false);
+        usb_state_ = UsbState::kPending;
+        usb_pending_since_us_ = esp_timer_get_time();
+        panel_->ShowToast("正在进入 USB U盘模式...");
+    } else {
+        if (usb_state_ == UsbState::kOff) {
+            return;
+        }
+        bool remounted = true;
+        if (usb_state_ == UsbState::kActive) {
+            usb_msc_->SetUsbOwned(false);
+            remounted = card_->IsMounted();
+            if (remounted) {
+                // The PC may have edited reminders.json / music while it owned the card.
+                // Invalidate the cached data layer so the device reloads the current contents
+                // instead of firing stale reminders (which would clobber the PC's edits).
+                storage_loaded_ = false;
+                reminders_->Load();
+                storage_loaded_ = true;
+                music_->Rescan();
+                storage_->Ensure(true);
+            }
+        }
+        SetWorkEnabled(true);
+        usb_state_ = UsbState::kOff;
+        panel_->ShowToast(remounted ? "已退出 USB U盘模式" : "重新挂载失败，请在设置里重试或检查卡格式");
+    }
+#else
+    (void)on;
+#endif
+}
+
+void MetaOs::TickUsb() {
+#if CONFIG_METAOS_USB_MSC
+    if (usb_state_ != UsbState::kPending) {
+        return;
+    }
+    auto& app = Application::GetInstance();
+    // Abort if the drain never completes (e.g. a long firmware install), instead of starving
+    // forever with the settings switch already showing ON.
+    if (esp_timer_get_time() - usb_pending_since_us_ > 15LL * 1000 * 1000) {
+        SetWorkEnabled(true);
+        usb_state_ = UsbState::kOff;
+        panel_->ShowToast("进入 USB 模式超时，请重试");
+        return;
+    }
+    // Sticky quiesce: music may have been re-queued (MCP/gesture) since the entry request.
+    if (music_->IsPlaying() || music_->IsPending()) {
+        music_->StopPlayback();
+    }
+    // Only switch FAT ownership to USB when no file is in use: the PostWork worker drained,
+    // the firmware worker finished, and the notification demuxer worker has closed its SD
+    // file (IsLocalPlaybackBusy, not just the synchronous IsLocalPlaybackActive flag).
+    if (WorkIdle() && !firmware_->busy() && !music_->IsPlaying() && !music_->IsPending() &&
+        !app.IsLocalPlaybackActive() && !app.IsLocalPlaybackBusy()) {
+        // Gate off file access before the FAT volume changes hands (defense in depth).
+        card_->SetAppMounted(false);
+        if (usb_msc_->SetUsbOwned(true)) {
+            usb_state_ = UsbState::kActive;
+            panel_->ShowToast("USB U盘模式已开启");
+        } else {
+            SetWorkEnabled(true);
+            usb_state_ = UsbState::kOff;
+            panel_->ShowToast("进入 USB 模式失败");
+        }
+    }
+#endif
 }
 
 void MetaOs::FireReminders() {
@@ -247,6 +395,18 @@ void MetaOs::TogglePanel() { panel_->Toggle(); }
 
 void MetaOs::RegisterTools() {
     auto& mcp = McpServer::GetInstance();
+
+#if CONFIG_METAOS_USB_MSC
+    mcp.AddTool("self.usb_msc.set",
+                "Expose the TF card to a connected PC as a USB U-disk (enable=true), or return it "
+                "to the device (enable=false). While USB owns the card, device file access "
+                "(music, reminders, files) is paused. Ask the user to confirm before enabling.",
+                PropertyList({Property("enable", kPropertyTypeBoolean, false)}),
+                [this](const PropertyList& properties) {
+                    RequestUsbMode(properties["enable"].value<bool>());
+                    return true;
+                });
+#endif
 
     // Reminders.
     mcp.AddTool("self.reminder.add",

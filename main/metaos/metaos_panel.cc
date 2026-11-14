@@ -1142,6 +1142,16 @@ void MetaPanel::BuildSettings() {
         }
     });
 
+    // USB U-disk: expose the TF card to a PC. Only shown when the feature is available.
+    if (hooks_.usb_msc_available && hooks_.usb_msc_available()) {
+        bool usb_on = hooks_.usb_msc_active && hooks_.usb_msc_active();
+        AddSwitchRow(area, text::kUsbMsc, usb_on, [this](bool enabled) {
+            if (hooks_.usb_msc_set) {
+                hooks_.usb_msc_set(enabled);
+            }
+        });
+    }
+
     AddLabel(area, text::kVoiceHint, true);
 
     // Firmware management: install / switch images from the TF-card repository.

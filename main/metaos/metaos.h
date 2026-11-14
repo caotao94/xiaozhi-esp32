@@ -1,7 +1,10 @@
 #ifndef METAOS_H
 #define METAOS_H
 
+#include <sdkconfig.h>
+
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,6 +23,7 @@ class MusicPlayer;
 class MotionDetector;
 class SpeechSynthesizer;
 class FirmwareManager;
+class UsbMsc;
 struct Reminder;
 
 // MetaOS V2 on top of XiaoZhi. Adds SD card storage, reminders and local music playback,
@@ -43,6 +47,14 @@ public:
     // Main task. Opens the touch UI, or closes it when it is open (LCD with LVGL only).
     void TogglePanel();
 
+    // USB MSC (TF card as a U-disk). Main task. available() is true when the feature is
+    // compiled in and started; active() is true while entering or holding USB ownership.
+    bool usb_msc_available() const;
+    bool usb_msc_active() const;
+    // Request entering (on=true) or leaving (on=false) USB mode. Entering is asynchronous:
+    // file access is quiesced and the card is handed to USB once all workers are idle.
+    void RequestUsbMode(bool on);
+
 private:
     void RegisterTools();
     void OnTick();
@@ -50,6 +62,8 @@ private:
     void LoadSettings();
     void SaveSettings();
     void RetryCard();
+    // Main task. Completes a pending USB-mode entry once every file user is idle.
+    void TickUsb();
 
     std::unique_ptr<Storage> storage_;
     std::unique_ptr<ReminderStore> reminders_;
@@ -58,6 +72,13 @@ private:
     std::unique_ptr<SpeechSynthesizer> speech_;
     std::unique_ptr<FirmwareManager> firmware_;
     Qmi8658* imu_;
+    SdmmcCard* card_ = nullptr;
+#if CONFIG_METAOS_USB_MSC
+    std::unique_ptr<UsbMsc> usb_msc_;
+    enum class UsbState { kOff, kPending, kActive };
+    UsbState usb_state_ = UsbState::kOff;
+    int64_t usb_pending_since_us_ = 0;
+#endif
     MetaSettings settings_;
     std::unique_ptr<MetaPanel> panel_;
     void* tick_timer_ = nullptr;

@@ -42,6 +42,7 @@ inline constexpr const char* kImageLoadFailed = "图片加载失败";
 inline constexpr const char* kUnsupportedFormat = "不支持的格式";
 inline constexpr const char* kShakeNext = "摇一摇切歌";
 inline constexpr const char* kFlipStop = "翻转停止";
+inline constexpr const char* kUsbMsc = "USB U盘模式";
 inline constexpr const char* kSpeakReminders = "提醒语音播报";
 inline constexpr const char* kVoiceDataMissing = "缺少语音数据文件";
 #else
@@ -78,6 +79,7 @@ inline constexpr const char* kImageLoadFailed = "Failed to load image";
 inline constexpr const char* kUnsupportedFormat = "Unsupported format";
 inline constexpr const char* kShakeNext = "Shake to skip";
 inline constexpr const char* kFlipStop = "Flip to stop";
+inline constexpr const char* kUsbMsc = "USB drive mode";
 inline constexpr const char* kSpeakReminders = "Speak reminders";
 inline constexpr const char* kVoiceDataMissing = "Voice data file missing";
 #endif

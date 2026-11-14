@@ -7,6 +7,8 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
+#include <atomic>
+
 #define TAG "MetaWorker"
 
 namespace metaos {
@@ -19,6 +21,10 @@ constexpr UBaseType_t kPriority = 1;
 constexpr UBaseType_t kQueueDepth = 4;
 
 QueueHandle_t queue = nullptr;
+// Gates new jobs (USB MSC quiesce) and counts queued+running jobs so callers can wait for
+// the worker to drain before handing the SD card to USB.
+std::atomic<bool> enabled{true};
+std::atomic<int> pending{0};
 
 void WorkerTask(void*) {
     while (true) {
@@ -26,6 +32,7 @@ void WorkerTask(void*) {
         if (xQueueReceive(queue, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
             (*job)();
             delete job;
+            pending.fetch_sub(1);
         }
     }
 }
@@ -52,18 +59,25 @@ bool EnsureStarted() {
 }  // namespace
 
 bool PostWork(std::function<void()> job) {
-    if (!EnsureStarted()) {
+    if (!enabled.load() || !EnsureStarted()) {
         return false;
     }
     auto* boxed = new (std::nothrow) std::function<void()>(std::move(job));
     if (boxed == nullptr) {
         return false;
     }
+    // Count before enqueue so WorkIdle() never reads idle between enqueue and pickup.
+    pending.fetch_add(1);
     if (xQueueSend(queue, &boxed, 0) != pdTRUE) {
+        pending.fetch_sub(1);
         delete boxed;
         return false;
     }
     return true;
 }
+
+void SetWorkEnabled(bool on) { enabled.store(on); }
+
+bool WorkIdle() { return pending.load() == 0; }
 
 }  // namespace metaos

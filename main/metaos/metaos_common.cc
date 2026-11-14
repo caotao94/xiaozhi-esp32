@@ -66,6 +66,12 @@ bool Storage::Ensure(bool force) {
     if (card_ == nullptr || !card_->Mount(force)) {
         return false;
     }
+    // In USB MSC mode the bare card stays initialized while USB owns FAT. Require the app
+    // mount before touching the filesystem, so Ensure()-based writers (reminder save, music
+    // scan, storage info) respect ownership instead of bypassing the IsMounted() gate.
+    if (card_->usb_msc() && !card_->IsMounted()) {
+        return false;
+    }
     if (!folders_ready_) {
         folders_ready_ =
             EnsureFolder(card_->mount_point() + "/" + kDataFolder) && EnsureFolder(MusicPath());

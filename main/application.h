@@ -129,6 +129,10 @@ public:
                             std::function<void(bool completed)> on_finished = nullptr);
     void StopLocalPlayback();
     bool IsLocalPlaybackActive() const { return local_playback_active_; }
+    // True while the notification demuxer worker is still running. It may hold an SD-card
+    // file open even after IsLocalPlaybackActive() goes false (Stop() is asynchronous), so
+    // callers that tear down the filesystem must wait for this to clear. Main task.
+    bool IsLocalPlaybackBusy() const;
     // Main task. True when StartLocalPlayback() would be accepted now: the device is idle,
     // the previous playback task has exited and no conversation channel is open.
     bool CanStartLocalPlayback() const;

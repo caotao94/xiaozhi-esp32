@@ -112,69 +112,79 @@ void MotionDetector::ProcessSample(float ax, float ay, float az) {
     float magnitude = std::sqrt(ax * ax + ay * ay + az * az);
     if (settings_.shake_enabled) {
         DetectShake(magnitude);
+    } else {
+        // Reset on the sampling-task side so a pending count cannot freeze while disabled and
+        // fire a phantom skip when the gesture is re-enabled.
+        shake_count_ = 0;
+        shake_high_ = false;
     }
     if (settings_.flip_enabled) {
-        DetectFlip(az);
+        DetectFlip(gravity_z_);
+    } else {
+        flip_armed_ = false;
+        flipped_ = false;
+        flip_triggered_ = false;
     }
 }
 
 void MotionDetector::DetectShake(float magnitude) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    // Look for peaks above threshold
-    if (magnitude > kShakeThreshold && !shake_high_) {
+    // Register one discrete shake: above the raised threshold, re-armed near rest, and past the
+    // refractory gap. Latch shake_high_ on EVERY above-threshold sample (even one the gap
+    // rejects), so a single shake's rebound peak cannot straddle the gap boundary and count a
+    // second time — it must first dip below kShakeRearm to re-arm.
+    if (magnitude > kShakeThreshold) {
+        if (!shake_high_ && (now - last_shake_time_) >= kShakeMinGap) {
+            last_shake_time_ = now;
+            shake_count_++;
+        }
         shake_high_ = true;
-
-        // Add peak timestamp
-        if (shake_peak_count_ < kShakePeaksNeeded) {
-            shake_peaks_[shake_peak_count_++] = now;
-        } else {
-            // Shift window
-            for (int i = 0; i < kShakePeaksNeeded - 1; i++) {
-                shake_peaks_[i] = shake_peaks_[i + 1];
-            }
-            shake_peaks_[kShakePeaksNeeded - 1] = now;
-        }
-
-        // Check if we have enough peaks in the time window
-        if (shake_peak_count_ == kShakePeaksNeeded) {
-            uint32_t window = now - shake_peaks_[0];
-            if (window <= kShakeWindow) {
-                ESP_LOGI(TAG, "Shake detected!");
-                shake_peak_count_ = 0;  // Reset to avoid repeated triggers
-                if (callbacks_.on_shake) {
-                    Application::GetInstance().Schedule([cb = callbacks_.on_shake]() { cb(); });
-                }
-            }
-        }
-    } else if (magnitude < kShakeThreshold * 0.7f) {
+    } else if (magnitude < kShakeRearm) {
         shake_high_ = false;
     }
 
-    // Age out old peaks
-    if (shake_peak_count_ > 0 && (now - shake_peaks_[0]) > kShakeWindow * 2) {
-        shake_peak_count_ = 0;
+    // After a quiet period, decide the gesture: 2 shakes -> next, 3+ -> previous, 1 -> nothing.
+    if (shake_count_ > 0 && (now - last_shake_time_) >= kShakeSettleTime) {
+        int n = shake_count_;
+        shake_count_ = 0;
+        shake_high_ = false;
+        if (n == 2 && callbacks_.on_shake_next) {
+            ESP_LOGI(TAG, "Shake x2 -> next track");
+            Application::GetInstance().Schedule([cb = callbacks_.on_shake_next]() { cb(); });
+        } else if (n >= 3 && callbacks_.on_shake_prev) {
+            ESP_LOGI(TAG, "Shake x%d -> previous track", n);
+            Application::GetInstance().Schedule([cb = callbacks_.on_shake_prev]() { cb(); });
+        }
     }
 }
 
-void MotionDetector::DetectFlip(float z) {
+void MotionDetector::DetectFlip(float gravity_z) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    if (z < kFlipThreshold) {
-        // Device is flipped (z-axis pointing down)
-        if (!flipped_) {
-            flipped_ = true;
-            flip_start_ = now;
-        } else if ((now - flip_start_) >= kFlipStableTime) {
-            // Stable flip for the required duration
-            ESP_LOGI(TAG, "Flip detected!");
-            flip_start_ = now + kFlipStableTime * 2;  // Cooldown to avoid repeats
-            if (callbacks_.on_flip_over) {
-                Application::GetInstance().Schedule([cb = callbacks_.on_flip_over]() { cb(); });
+    if (gravity_z > kFlipUpThreshold) {
+        // Face-up: arm the gesture and clear any face-down hold / trigger latch.
+        flip_armed_ = true;
+        flipped_ = false;
+        flip_triggered_ = false;
+    } else if (gravity_z < kFlipDownThreshold) {
+        // Face-down: only counts as a flip if the device was face-up first and has not already
+        // fired this session. The hold must be continuous (the band below resets it).
+        if (flip_armed_ && !flip_triggered_) {
+            if (!flipped_) {
+                flipped_ = true;
+                flip_start_ = now;
+            } else if ((now - flip_start_) >= kFlipStableTime) {
+                flip_triggered_ = true;
+                flipped_ = false;
+                ESP_LOGI(TAG, "Flip detected (face-up -> face-down held)");
+                if (callbacks_.on_flip_over) {
+                    Application::GetInstance().Schedule([cb = callbacks_.on_flip_over]() { cb(); });
+                }
             }
         }
     } else {
-        // Device returned to normal orientation
+        // In the hysteresis band: interrupt the hold (must be continuous), keep the armed state.
         flipped_ = false;
     }
 }

@@ -42,6 +42,11 @@ public:
         std::function<void(const Reminder& reminder, int minutes)> snooze;
         std::function<void()> settings_changed;
         std::function<void()> retry_card;
+        // USB MSC (TF card as U-disk). available() gates the settings switch; active() is its
+        // state; set() requests entering/leaving USB mode. Empty when the feature is off.
+        std::function<bool()> usb_msc_available;
+        std::function<bool()> usb_msc_active;
+        std::function<void(bool)> usb_msc_set;
     };
 
     struct Button;

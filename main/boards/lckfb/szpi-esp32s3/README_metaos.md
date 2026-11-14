@@ -58,6 +58,45 @@ ESP-IDF 的 FATFS 不支持 exFAT。64 GB 卡出厂一般是 exFAT，必须先�
 
 TF 卡在开机时挂载。没有卡或卡无法挂载时，设备照常工作，相关工具会返回"SD 卡不可用"。之后插卡，相关工具调用时会自动重试挂载（每 30 秒最多一次）。不支持运行中热插拔，拔卡前请关机。
 
+## USB U盘模式（TF 卡免拔插拷贝）
+
+编译开关 `CONFIG_METAOS_USB_MSC=y`（默认 / 微信 MetaOS 变体已开启，依赖 `METAOS_ENABLE` + ESP32-S3）。
+开启后设备通过原生 USB 口（GPIO19/20）把 TF 卡暴露给电脑当 U 盘，直接读写 `music/`、
+`esp_tts_voice_data_xiaole.dat` 等文件，**无需拔卡用读卡器**。基于乐鑫 `esp_tinyusb` 组件（MSC 类）。
+
+### 使用
+
+- **触屏**：设置页 → "USB U盘模式" 开关。
+- **语音 / MCP**：`self.usb_msc.set enable=true` 开启，`enable=false` 关闭。
+
+开启后电脑识别到一个 U 盘（默认产品名 "Espressif MSC Device"），可直接拷贝文件。
+关闭后卡归还设备，固件自动重载电脑改过的提醒 / 音乐。
+
+### 所有权与安全（重要）
+
+TF 卡的 FAT 文件系统同一时刻只能由一方挂载：
+
+- **设备模式（APP）**：固件挂载 FAT，MetaOS 正常读写。
+- **U盘模式（USB）**：固件卸载 FAT，电脑独占。期间设备的音乐 / 提醒 / 文件访问自动暂停，
+  避免两边同时写卡损坏 FAT。
+
+进入 U盘模式前，固件会先停止音乐、取消固件安装、等待所有后台文件操作结束（drain），
+确认没有打开的文件句柄后才把卡交给电脑——**播放音乐时直接切换也是安全的**。
+
+**务必先在电脑上"安全弹出"再关闭 U盘模式**。固件启用了异步 IO（`CONFIG_TINYUSB_MSC_ASYNC_IO`），
+切回设备时会先排空电脑延迟写入的数据再重挂 FAT；但电脑写缓存未 flush 时强行切换仍有风险。
+
+### 限制与注意
+
+- **PHY 互斥**：ESP32-S3 的 USB-OTG 与 USB-Serial-JTAG 共用一个 PHY。U盘模式运行期间
+  USB 辅助串口控制台失效；**主 UART 控制台（COM7）不受影响**，烧录仍可用 ROM 下载模式。
+- TF 卡仍须 **FAT32**（设备侧）。exFAT 卡设备会提示"需要 FAT32"；电脑侧虽能读 exFAT，
+  但设备无法使用，建议统一 FAT32。
+- 不支持 U盘模式下热拔卡；拔卡 / 电脑重格式化后若设备无法重挂，到设置页"重新检测"恢复（无需重启）。
+- MSC 缓冲 `CONFIG_TINYUSB_MSC_BUFSIZE` 默认 512B，可调大提升吞吐。
+- 仅 ESP32-S3 原生 USB 口可用；功能默认关闭，其他板 / 变体不受影响（依赖按 Kconfig 门控，
+  不会给非 MetaOS 的 S3 构建引入 TinyUSB）。
+
 ## 音乐播放
 
 把 **单声道 Ogg Opus** 文件放进 TF 卡的 `music/` 目录。立创实战派的 codec 是 ES8311（单声道输出）+ ES7210（双声道输入），播放只支持单声道。
@@ -163,6 +202,7 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 - **TF 卡**：显示已用空间和总容量，或错误信息（如"未检测到 TF 卡"、"TF 卡不是 FAT32 格式"）。点击"重新检测"可以手动触发挂载重试
 - **摇一摇切歌**：开启后，摇动设备可以跳到下一首歌（需要 IMU 传感器）
 - **翻转停止**：开启后，将设备翻转面朝下可以停止音乐播放或关闭提醒弹窗（需要 IMU 传感器）
+- **USB U盘模式**：把 TF 卡暴露给电脑当 U 盘（仅 `CONFIG_METAOS_USB_MSC=y` 时显示，见上文专节）
 - **提示**：底部显示"长按 BOOT 键打开或关闭此界面"
 
 ### 弹窗提醒
@@ -188,9 +228,9 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 
 立创实战派 ESP32-S3 板载 QMI8658 6 轴 IMU（加速度计 + 陀螺仪）。固件会自动探测传感器（I2C 地址 0x6A 或 0x6B）。
 
-**手势检测**：
-- **摇一摇**：1.2 秒内检测到 3 次 >1.9g 的加速度峰值 → 跳到下一首歌（需在设置中开启）
-- **翻转**：设备翻转面朝下并保持稳定 >0.5s → 停止音乐播放或关闭提醒弹窗（需在设置中开启）
+**手势检测**（阈值偏保守以防误触，常量在 `main/metaos/metaos_motion.h`，可按硬件微调）：
+- **摇一摇切歌**：**摇 2 下 → 下一首，摇 3 下及以上 → 上一首，单下不动作**。判定：加速度幅值 >2.5g 计一次，300ms 不应期避免单次摇晃的多个波峰重复计数；停止摇动 700ms 后按累计次数判定。需在设置中开启。
+- **翻转停止**：需**先从正面朝上翻到背面朝下，并连续稳定保持 1.2s** → 停止音乐或关闭提醒弹窗。用滤波后的重力 z + 迟滞带（±600mg）防抖；轻拿轻放、短暂倾斜、或未经翻转直接朝下放置都不会误触；触发后须翻回正面才能再次触发。需在设置中开启。
 
 **MCP 工具**：
 - `self.motion.get_state`：查询当前加速度（毫重力单位）、方向（lying_flat）和运动状态（moving）
@@ -199,7 +239,7 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 
 ## MCP 工具列表
 
-设备向小智服务器注册了 8 个 MCP 工具：
+设备向小智服务器注册了 9 个 MCP 工具（部分按硬件 / 配置条件注册）：
 
 | 工具 | 功能 |
 |------|------|
@@ -211,6 +251,7 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 | `self.music.control` | 控制播放（`action` 为 `"next"` 或 `"stop"`） |
 | `self.storage.get_info` | 查询 TF 卡状态、空间、提醒数量、歌曲数量 |
 | `self.motion.get_state` | 查询 IMU 运动传感器状态（加速度、方向、运动）—— 仅当 IMU 可用时注册 |
+| `self.usb_msc.set` | 开启 / 关闭 USB U盘模式（`enable` 布尔）—— 仅当 `CONFIG_METAOS_USB_MSC=y` 时注册 |
 
 ## 已知限制
 
@@ -247,6 +288,11 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 - [ ] 翻转停止音乐/关闭弹窗
 - [ ] 设置页面：音量、亮度、TF 卡重检测、手势开关
 - [ ] IMU MCP 工具：`self.motion.get_state` 返回正确的加速度和状态
+- [ ] USB U盘模式：电脑枚举为 U 盘、读写 TF 卡文件
+- [ ] USB 切换安全：播放音乐时开启 U盘模式不崩溃；电脑安全弹出后关闭，文件无损坏
+- [ ] USB PHY 互斥：U盘模式下主 UART（COM7）控制台正常、可烧录
+- [ ] USB 异常恢复：U盘模式下拔卡 / 电脑重格式化后，"重新检测"能恢复
+- [ ] exFAT 卡提示"需要 FAT32"（不误报已挂载）
 
 ## Factory 救援变体（lichuang-dev-rescue）
 
@@ -277,8 +323,8 @@ ffmpeg -i song.mp3 -vn -ac 1 -ar 48000 -c:a libopus -b:a 32k song.ogg
 | 变体 | 用途 | 关键配置 |
 |---|---|---|
 | `lichuang-dev` | 原版小智 | — |
-| `lichuang-dev-metaos` | MetaOS 主固件（默认样式） | METAOS_ENABLE、分区表 16m_metaos.csv |
-| `lichuang-dev-metaos-wechat` | MetaOS + 微信样式 | 额外 USE_WECHAT_MESSAGE_STYLE |
+| `lichuang-dev-metaos` | MetaOS 主固件（默认样式） | METAOS_ENABLE、METAOS_USB_MSC、分区表 16m_metaos.csv |
+| `lichuang-dev-metaos-wechat` | MetaOS + 微信样式 | 额外 USE_WECHAT_MESSAGE_STYLE（同样含 USB MSC） |
 | `lichuang-dev-rescue` | Factory 救援（中文 UI） | METAOS_RESCUE_MODE，无音频/蓝牙/assets |
 
 构建命令（`--language` 由 build.py 控制，会覆盖 config.json；MetaOS 系列用 zh-CN）：
@@ -333,6 +379,8 @@ python scripts/firmware_package.py verify --dir F:/metaos/firmware/default --key
 - `--target-board` 填板型 `lichuang-dev`（安装时与 BOARD_TYPE/BOARD_NAME 比对）。
 - 无签名包默认允许安装（`CONFIG_METAOS_FW_REQUIRE_SIGNATURE=n`）；**有签名但验签失败一律拒绝**。
 - manifest 的 `signature` 字段只在 `--key` 时写入；无签名字段为空，设备据此区分"未签名/已签名"。
+- 默认 / 微信 MetaOS 变体现含 USB MSC。SD 仓库中对应的 MSC 包命名为 `usb-msc` / `wechat-msc`
+  （显示名"默认+USB U盘"/"微信+USB U盘"），与早期不含 MSC 的 `default` / `wechat` 包并存，便于回滚对比。
 
 ### 切换与安装的可靠方式
 

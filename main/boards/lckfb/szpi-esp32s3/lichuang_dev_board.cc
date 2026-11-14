@@ -306,11 +306,17 @@ private:
         press_to_talk_tool_->Initialize();
 
 #if CONFIG_METAOS_ENABLE
+#if CONFIG_METAOS_USB_MSC
+        constexpr bool kCardUsbMsc = true;
+#else
+        constexpr bool kCardUsbMsc = false;
+#endif
         sd_card_ = new SdmmcCard({
             .mount_point = SD_CARD_MOUNT_POINT,
             .clk = SD_CARD_PIN_CLK,
             .cmd = SD_CARD_PIN_CMD,
             .d0 = SD_CARD_PIN_D0,
+            .usb_msc = kCardUsbMsc,
         });
         // Probe for IMU sensor
         imu_ = Qmi8658::Probe(i2c_bus_);

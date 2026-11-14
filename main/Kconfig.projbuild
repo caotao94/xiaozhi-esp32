@@ -1257,6 +1257,18 @@ menu "MetaOS"
             MCP tools for reminders and local Ogg music playback, plus a touch UI
             (long press BOOT to open/close). Cards must be FAT32.
             Build the "lichuang-dev-metaos" variant instead of enabling this by hand.
+
+    config METAOS_USB_MSC
+        bool "Enable USB MSC (expose TF card to PC as a U-disk)"
+        default n
+        depends on METAOS_ENABLE && IDF_TARGET_ESP32S3
+        select TINYUSB_MSC_ENABLED
+        help
+            Adds a USB Mass Storage device on the native USB port (GPIO19/20) so a PC can
+            read/write the TF card directly, without removing it. While USB owns the card the
+            firmware unmounts FAT and MetaOS file access is suspended to avoid corruption.
+            Note: the USB-OTG PHY is shared with USB-Serial-JTAG, so the secondary USB console
+            is unavailable while MSC is active; the main UART console is unaffected.
 endmenu
 
 menu "TAIJIPAI_S3_CONFIG"
