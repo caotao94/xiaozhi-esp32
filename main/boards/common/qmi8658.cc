@@ -5,6 +5,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <cmath>
 #include <cstring>
 #include <new>
 
@@ -95,6 +96,14 @@ bool Qmi8658::Initialize() {
     }
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // CTRL1: enable serial address auto-increment (bit6 ADDR_AI=1), little-endian (bit5 BE=0).
+    // After reset CTRL1 defaults to 0x00 (auto-increment OFF), which makes a 6-byte burst read
+    // return the SAME register (AX_L) six times -> ax==ay==az garbage. Auto-increment is required
+    // for ReadAccel/ReadGyro to fetch AX,AY,AZ (and GX,GY,GZ) as distinct registers.
+    if (!WriteReg(QMI8658_CTRL1, 0x40)) {
+        return false;
+    }
+
     // Configure accelerometer: ±4g range, 25Hz ODR
     // CTRL2: [7:4]=ODR, [3:1]=range, [0]=enable
     // ODR: 0x5 = 25Hz, Range: 1 = ±4g
@@ -115,7 +124,35 @@ bool Qmi8658::Initialize() {
         return false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));  // let the sensor settle before calibrating
+
+    // Empirically calibrate the accel scale. The measured stationary gravity magnitude should be
+    // 1g = 1000mg, but the actual counts-per-g of this chip/config differs from the datasheet
+    // nominal (observed ~982 counts/g rather than 8192). Deriving scale from the measured 1g makes
+    // the mg readings correct regardless. Assumes the device is roughly stationary at boot.
+    double sum_mag = 0.0;
+    int samples = 0;
+    for (int i = 0; i < 16; i++) {
+        uint8_t r[6];
+        if (ReadRegs(QMI8658_AX_L, r, 6)) {
+            int16_t x = static_cast<int16_t>((r[1] << 8) | r[0]);
+            int16_t y = static_cast<int16_t>((r[3] << 8) | r[2]);
+            int16_t z = static_cast<int16_t>((r[5] << 8) | r[4]);
+            sum_mag += std::sqrt(static_cast<double>(x) * x + static_cast<double>(y) * y +
+                                 static_cast<double>(z) * z);
+            samples++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (samples > 0) {
+        double avg_counts = sum_mag / samples;
+        if (avg_counts > 100.0) {  // sanity: gravity must be substantial
+            accel_scale_ = 1000.0 / avg_counts;
+            ESP_LOGI(TAG, "Accel scale calibrated: gravity=%.1f counts -> %.4f mg/LSB",
+                     avg_counts, accel_scale_);
+        }
+    }
+
     return true;
 }
 

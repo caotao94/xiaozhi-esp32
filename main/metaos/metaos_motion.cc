@@ -111,12 +111,12 @@ void MotionDetector::ProcessSample(float ax, float ay, float az) {
     // Gesture detection
     float magnitude = std::sqrt(ax * ax + ay * ay + az * az);
     if (settings_.shake_enabled) {
-        DetectShake(magnitude);
+        DetectShake(ax, ay, magnitude);
     } else {
         // Reset on the sampling-task side so a pending count cannot freeze while disabled and
         // fire a phantom skip when the gesture is re-enabled.
         shake_count_ = 0;
-        shake_high_ = false;
+        shake_active_ = false;
     }
     if (settings_.flip_enabled) {
         DetectFlip(gravity_z_);
@@ -127,28 +127,77 @@ void MotionDetector::ProcessSample(float ax, float ay, float az) {
     }
 }
 
-void MotionDetector::DetectShake(float magnitude) {
+void MotionDetector::DetectShake(float ax, float ay, float magnitude) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    // Register one discrete shake: above the raised threshold, re-armed near rest, and past the
-    // refractory gap. Latch shake_high_ on EVERY above-threshold sample (even one the gap
-    // rejects), so a single shake's rebound peak cannot straddle the gap boundary and count a
-    // second time — it must first dip below kShakeRearm to re-arm.
-    if (magnitude > kShakeThreshold) {
-        if (!shake_high_ && (now - last_shake_time_) >= kShakeMinGap) {
-            last_shake_time_ = now;
-            shake_count_++;
-        }
-        shake_high_ = true;
-    } else if (magnitude < kShakeRearm) {
-        shake_high_ = false;
+    // Remove the gravity/tilt DC from the horizontal axes so only the shake oscillation remains.
+    ax_dc_ = ax_dc_ * (1.0f - kShakeDcAlpha) + ax * kShakeDcAlpha;
+    ay_dc_ = ay_dc_ * (1.0f - kShakeDcAlpha) + ay * kShakeDcAlpha;
+    float ax_ac = ax - ax_dc_;
+    float ay_ac = ay - ay_dc_;
+
+    // Vibration-reject cooldown: after a bout is discarded as sustained vibration, block new
+    // bouts until the input has been quiet for a full settle period, so the vibration tail cannot
+    // immediately re-arm and fire a trailing skip.
+    if (magnitude >= kShakeThreshold) {
+        shake_quiet_since_ = now;
+    } else if (shake_reject_ && (now - shake_quiet_since_) >= kShakeSettleTime) {
+        shake_reject_ = false;
     }
 
-    // After a quiet period, decide the gesture: 2 shakes -> next, 3+ -> previous, 1 -> nothing.
-    if (shake_count_ > 0 && (now - last_shake_time_) >= kShakeSettleTime) {
+    // Activate a bout on motion (unless rejecting vibration). Lock the dominant axis here so
+    // circular/diagonal shakes are not broken by per-sample axis chatter.
+    if (magnitude > kShakeThreshold && !shake_active_ && !shake_reject_) {
+        shake_active_ = true;
+        shake_bout_start_ = now;
+        shake_last_activity_ = now;
+        shake_dom_axis_ = (std::abs(ax_ac) >= std::abs(ay_ac)) ? 0 : 1;
+        float sig0 = (shake_dom_axis_ == 0) ? ax_ac : ay_ac;
+        // The >2g gate already confirms real motion. If the bout opens on a positive swing, that
+        // first push is a genuine cycle — seed it so counting is phase-invariant (the alternative,
+        // seeding cross_high without counting, swallows the first cycle for positive-phase starts).
+        if (sig0 > kShakeCrossHyst) {
+            shake_cross_high_ = true;
+            shake_count_ = 1;
+        } else {
+            shake_cross_high_ = false;
+            shake_count_ = 0;
+        }
+    }
+
+    if (shake_active_) {
+        float sig = (shake_dom_axis_ == 0) ? ax_ac : ay_ac;
+        // Schmitt trigger with a decoupled re-arm level, evaluated on EVERY sample (outside the
+        // raw-magnitude gate): count on a rising crossing of +kShakeCrossHyst, re-arm once the
+        // signal drops below the much lower kShakeRearmLevel. The wide hysteresis band rejects
+        // vibration chatter while still counting asymmetric (weak-return) shakes and working under
+        // tilt, where the raw magnitude may stay below the gate on the return stroke.
+        if (sig > kShakeCrossHyst && !shake_cross_high_) {
+            shake_cross_high_ = true;
+            shake_count_++;
+            shake_last_activity_ = now;
+        } else if (sig < kShakeRearmLevel && shake_cross_high_) {
+            // Edge-triggered re-arm: only the high->low transition stamps activity. Without the
+            // cross_high guard, every quiet sample (sig~0 < rearm level) would refresh the timer
+            // and the bout could never settle — it would always run to the vibration cap.
+            shake_cross_high_ = false;
+            shake_last_activity_ = now;
+        }
+        // Structural caps: a real gesture is brief and few cycles. Discard sustained/periodic
+        // vibration and latch reject until the input is quiet (see cooldown above).
+        if ((now - shake_bout_start_) > kShakeMaxBout || shake_count_ > kShakeMaxCount) {
+            shake_active_ = false;
+            shake_count_ = 0;
+            shake_reject_ = true;
+        }
+    }
+
+    // Finalize after quiet — including count==0 bouts, so a noise-locked bout always resets and
+    // cannot swallow the next real shake. 2 cycles -> next, 3+ -> previous, 0/1 -> none.
+    if (shake_active_ && (now - shake_last_activity_) >= kShakeSettleTime) {
         int n = shake_count_;
+        shake_active_ = false;
         shake_count_ = 0;
-        shake_high_ = false;
         if (n == 2 && callbacks_.on_shake_next) {
             ESP_LOGI(TAG, "Shake x2 -> next track");
             Application::GetInstance().Schedule([cb = callbacks_.on_shake_next]() { cb(); });
@@ -168,8 +217,9 @@ void MotionDetector::DetectFlip(float gravity_z) {
         flipped_ = false;
         flip_triggered_ = false;
     } else if (gravity_z < kFlipDownThreshold) {
-        // Face-down: only counts as a flip if the device was face-up first and has not already
-        // fired this session. The hold must be continuous (the band below resets it).
+        // A deliberate flip: the device was face-up first, has not fired this session, and is held
+        // face-down continuously for kFlipStableTime. The filtered gravity z rides through brief
+        // vibration; the hysteresis band below resets the hold only on a real orientation change.
         if (flip_armed_ && !flip_triggered_) {
             if (!flipped_) {
                 flipped_ = true;
