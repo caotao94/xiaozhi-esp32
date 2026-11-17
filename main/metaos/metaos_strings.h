@@ -45,6 +45,10 @@ inline constexpr const char* kFlipStop = "翻转停止";
 inline constexpr const char* kUsbMsc = "USB U盘模式";
 inline constexpr const char* kSpeakReminders = "提醒语音播报";
 inline constexpr const char* kVoiceDataMissing = "缺少语音数据文件";
+inline constexpr const char* kBattery = "电池";
+inline constexpr const char* kCharging = "充电中";
+inline constexpr const char* kDischarging = "放电中";
+inline constexpr const char* kBatteryIdle = "静置";
 #else
 inline constexpr const char* kMusic = "Music";
 inline constexpr const char* kReminders = "Reminders";
@@ -82,6 +86,10 @@ inline constexpr const char* kFlipStop = "Flip to stop";
 inline constexpr const char* kUsbMsc = "USB drive mode";
 inline constexpr const char* kSpeakReminders = "Speak reminders";
 inline constexpr const char* kVoiceDataMissing = "Voice data file missing";
+inline constexpr const char* kBattery = "Battery";
+inline constexpr const char* kCharging = "Charging";
+inline constexpr const char* kDischarging = "Discharging";
+inline constexpr const char* kBatteryIdle = "Idle";
 #endif
 
 }  // namespace metaos::text

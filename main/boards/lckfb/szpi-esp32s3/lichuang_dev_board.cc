@@ -9,8 +9,10 @@
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
 #include "i2c_device.h"
+#include "lichuang_display.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
+#include "sy6302.h"
 #include "wifi_board.h"
 #if CONFIG_METAOS_ENABLE
 #include "metaos.h"
@@ -76,6 +78,7 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+    Sy6302* battery_gauge_ = nullptr;
 #if CONFIG_METAOS_ENABLE
     SdmmcCard* sd_card_ = nullptr;
     Qmi8658* imu_ = nullptr;
@@ -101,6 +104,11 @@ private:
 
         // Initialize PCA9557
         pca9557_ = new Pca9557(i2c_bus_, 0x19);
+
+        // SY6302 fuel gauge (0x55): construct only — NO I2C traffic here. The gauge
+        // lazy-attaches on the first GetBatteryLevel() call >= 15 s after boot;
+        // probing 0x55 during boot init once hung the shared bus (reboot loop).
+        battery_gauge_ = new Sy6302(i2c_bus_);
     }
 
     void InitializeSpi() {
@@ -196,6 +204,11 @@ private:
 
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif CONFIG_LV_FONT_MONTSERRAT_10
+        // Custom status-bar battery widget (embedded percentage, charge colors).
+        display_ = new LichuangLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                          DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                          DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #else
         display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
@@ -351,6 +364,15 @@ public:
     }
 
     virtual Camera* GetCamera() override { return camera_; }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        return battery_gauge_ != nullptr &&
+               battery_gauge_->GetBatteryLevel(level, charging, discharging);
+    }
+
+    virtual bool GetBatteryInfo(BatteryInfo& info) override {
+        return battery_gauge_ != nullptr && battery_gauge_->GetBatteryInfo(info);
+    }
 };
 
 DECLARE_BOARD(LichuangDevBoard);

@@ -1127,6 +1127,21 @@ void MetaPanel::BuildSettings() {
         });
     }
 
+    // Battery gauge details (optional capability). GetBatteryInfo returns
+    // cached telemetry only — no I2C from this UI task.
+    BatteryInfo battery;
+    if (board.GetBatteryInfo(battery)) {
+        const char* state = battery.charging    ? text::kCharging
+                            : battery.discharging ? text::kDischarging
+                                                  : text::kBatteryIdle;
+        char title[40];
+        char detail[64];
+        snprintf(title, sizeof(title), "%s %d%%", text::kBattery, battery.level);
+        snprintf(detail, sizeof(detail), "%d mV · %+d mA · %s", battery.voltage_mv,
+                 battery.current_ma, state);
+        AddListRow(area, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL, title, detail, nullptr);
+    }
+
     // Motion gesture settings (if IMU is available)
     // TODO: Check if IMU exists before showing these
     AddSwitchRow(area, text::kShakeNext, settings_.shake_next, [this](bool enabled) {

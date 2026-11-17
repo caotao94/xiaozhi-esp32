@@ -43,6 +43,17 @@ enum class PowerSaveLevel {
 // data contains additional info like SSID for Connecting/Connected events
 using NetworkEventCallback = std::function<void(NetworkEvent event, const std::string& data)>;
 
+// Optional extended battery telemetry (fuel-gauge boards only). Values are
+// cached readings; implementations must not perform blocking I/O here so UI
+// tasks other than the main loop can call it safely.
+struct BatteryInfo {
+    int level = 0;        // state of charge, percent 0-100
+    int voltage_mv = 0;   // battery terminal voltage, millivolts
+    int current_ma = 0;   // battery current, milliamps; positive = charging
+    bool charging = false;
+    bool discharging = false;
+};
+
 void* create_board();
 class AudioCodec;
 class Display;
@@ -78,6 +89,7 @@ public:
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+    virtual bool GetBatteryInfo(BatteryInfo& info) { return false; }
     virtual std::string GetSystemInfoJson();
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
